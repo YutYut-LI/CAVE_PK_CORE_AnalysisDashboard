@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import html
 import io
 import traceback
 import hashlib
@@ -19,11 +20,31 @@ import matplotlib.dates as mdates
 from matplotlib.patches import Patch
 
 try:
+    import plotly.colors as pc
     import plotly.graph_objects as go
     from plotly.subplots import make_subplots
 except Exception:  # pragma: no cover
+    pc = None  # type: ignore
     go = None  # type: ignore
     make_subplots = None  # type: ignore
+
+# Plotly default qualitative palette (matches unset trace colours in charts).
+_PLOTLY_SERIES_COLORS = (
+    list(pc.qualitative.Plotly)
+    if pc is not None
+    else [
+        "#636EFA",
+        "#EF553B",
+        "#00CC96",
+        "#AB63FA",
+        "#FFA15A",
+        "#19D3F3",
+        "#FF6692",
+        "#B6E880",
+        "#FF97FF",
+        "#FECB52",
+    ]
+)
 
 
 # =========================================================
@@ -33,6 +54,28 @@ st.set_page_config(
     page_title="CAVE–PK CO2 Analysis Dashboard",
     layout="wide",
 )
+
+# Plotly charts: fill Streamlit column width on resize (laptops / narrow windows).
+st.markdown(
+    """
+    <style>
+    div[data-testid="stPlotlyChart"] { width: 100% !important; max-width: 100%; }
+    div[data-testid="stPlotlyChart"] .js-plotly-plot,
+    div[data-testid="stPlotlyChart"] .plotly,
+    div[data-testid="stPlotlyChart"] .plot-container.plotly {
+        width: 100% !important;
+        max-width: 100%;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+PLOTLY_CHART_CONFIG = {
+    "responsive": True,
+    "displayModeBar": True,
+    "displaylogo": False,
+}
 
 
 # =========================================================
@@ -468,6 +511,121 @@ def add_stage_shading(ax, stage_defs, stage_patches):
             stage_patches.append(Patch(facecolor=col, alpha=0.40, label=name))
 
 
+def add_plotly_stage_vrects(
+    fig,
+    stage_defs,
+    fill_opacity: float = 0.08,
+    row: Optional[Any] = None,
+    col: Optional[int] = None,
+) -> None:
+    """Shaded vertical bands for experiment stages (all panels or one subplot)."""
+    if not stage_defs:
+        return
+    for (_name, stt, ett, colr) in stage_defs:
+        kw = dict(x0=stt, x1=ett, fillcolor=colr, opacity=fill_opacity, line_width=0)
+        if row is not None:
+            fig.add_vrect(**kw, row=row, col=col if col is not None else 1)
+        else:
+            fig.add_vrect(**kw)
+
+
+def _stage_legend_items(stage_defs) -> List[Tuple[str, str, Any, Any]]:
+    """Unique (name, colour, start, end) for external stage legend."""
+    seen: set = set()
+    items: List[Tuple[str, str, Any, Any]] = []
+    for (name, stt, ett, colr) in stage_defs or []:
+        lab = str(name)
+        if lab in seen:
+            continue
+        seen.add(lab)
+        items.append((lab, str(colr), stt, ett))
+    return items
+
+
+def _series_color_for_index(index: int) -> str:
+    return _PLOTLY_SERIES_COLORS[index % len(_PLOTLY_SERIES_COLORS)]
+
+
+def _trace_legend_color(trace, index: int = 0, fig=None) -> str:
+    """Line/marker colour for an external legend swatch (must match trace styling)."""
+    try:
+        if getattr(trace, "line", None) and trace.line.color:
+            c = trace.line.color
+            if c and str(c).strip().lower() not in ("", "auto"):
+                return str(c)
+        if getattr(trace, "marker", None) and trace.marker.color:
+            c = trace.marker.color
+            if c and str(c).strip().lower() not in ("", "auto"):
+                return str(c)
+        if fig is not None and getattr(fig.layout, "colorway", None):
+            cw = list(fig.layout.colorway)
+            if cw:
+                return str(cw[index % len(cw)])
+    except Exception:
+        pass
+    return _series_color_for_index(index)
+
+
+def render_series_legend_outside(fig, *, title: str = "Sensors / series") -> None:
+    """Series key below the plot (for long legends on sensor compare charts)."""
+    if fig is None or not getattr(fig, "data", None):
+        return
+    chips = []
+    series_idx = 0
+    for tr in fig.data:
+        name = getattr(tr, "name", None)
+        if not name:
+            continue
+        colr = _trace_legend_color(tr, series_idx, fig)
+        series_idx += 1
+        safe_name = html.escape(str(name))
+        chips.append(
+            f'<span style="display:inline-flex;align-items:center;margin:3px 12px 3px 0;max-width:100%;">'
+            f'<span style="display:inline-block;width:22px;height:3px;background:{colr};'
+            f'border-radius:1px;margin-right:6px;flex-shrink:0;"></span>'
+            f'<span style="font-size:0.85rem;line-height:1.3;">{safe_name}</span></span>'
+        )
+    if not chips:
+        return
+    safe_title = html.escape(str(title))
+    st.markdown(
+        '<div class="series-legend-outside" style="display:block;margin:0.35rem 0 1.1rem 0;padding:10px 14px;'
+        'border:1px solid #d0d0d0;border-radius:8px;background:#fafafa;max-height:220px;overflow-y:auto;">'
+        f'<span style="font-weight:600;font-size:0.92rem;margin-right:12px;">{safe_title}</span>'
+        '<span style="display:inline-flex;flex-wrap:wrap;align-items:center;vertical-align:middle;">'
+        + "".join(chips)
+        + "</span></div>",
+        unsafe_allow_html=True,
+    )
+
+
+def render_stage_legend_outside(stage_defs, *, swatch_opacity: float = 0.38) -> None:
+    """Stage colour key below the plot (separate from the in-figure CAVE/PK legend)."""
+    items = _stage_legend_items(stage_defs)
+    if not items:
+        return
+    chips = []
+    for lab, colr, stt, ett in items:
+        t0 = pd.Timestamp(stt).strftime("%H:%M") if pd.notna(stt) else "?"
+        t1 = pd.Timestamp(ett).strftime("%H:%M") if pd.notna(ett) else "?"
+        chips.append(
+            f'<span style="display:inline-flex;align-items:center;margin:4px 14px 4px 0;white-space:nowrap;">'
+            f'<span style="display:inline-block;width:15px;height:15px;background:{colr};opacity:{swatch_opacity};'
+            f'border:1px solid rgba(0,0,0,0.45);margin-right:7px;flex-shrink:0;"></span>'
+            f'<span style="font-size:0.9rem;"><b>{lab}</b>'
+            f'<span style="color:#555;font-weight:normal;"> ({t0}–{t1})</span></span></span>'
+        )
+    st.markdown(
+        '<div class="stage-legend-outside" style="display:block;margin:0.35rem 0 1rem 0;padding:10px 14px;'
+        'border:1px solid #d0d0d0;border-radius:8px;background:#fafafa;">'
+        '<span style="font-weight:600;font-size:0.92rem;margin-right:12px;">Experiment stages</span>'
+        '<span style="display:inline-flex;flex-wrap:wrap;align-items:center;vertical-align:middle;">'
+        + "".join(chips)
+        + "</span></div>",
+        unsafe_allow_html=True,
+    )
+
+
 def prepare_stage_defs(stage_rows):
     if not stage_rows:
         return []
@@ -713,20 +871,22 @@ def plot_vertical_profiles_plotly(
                 marker=dict(size=ms),
             )
         )
-    # Pixel aspect: height : width = 2 : 1 (taller profile plots)
-    _pw, _ph = 320, 640
+    # Tall profile panels; width follows container (responsive).
+    _ph = 640
     _title = str(title).strip().replace("\n", "<br>")
     _tm = 78 if "<br>" in _title else 60
     fig.update_layout(
         title=dict(text=_title, x=0.5, xref="paper", xanchor="center"),
         xaxis_title=x_label,
         yaxis_title="z level",
-        width=_pw,
         height=_ph,
+        autosize=True,
         showlegend=True,
         template="plotly_white",
-        margin=dict(l=50, r=20, t=_tm, b=50),
+        margin=dict(l=58, r=24, t=_tm, b=52),
     )
+    fig.update_yaxes(automargin=True, title_standoff=10)
+    fig.update_xaxes(automargin=True)
     if x_range is not None:
         fig.update_xaxes(range=list(x_range))
     if y_range is not None:
@@ -819,15 +979,11 @@ def plot_overall_metrics(
     plt.setp(axs[-1, 1].get_xticklabels(), rotation=45)
 
     leg_fs = max(5, min(24, int(legend_fontsize)))
-    leg_fs_stage = max(5, leg_fs - 1)
 
     h1, l1 = axs[0, 1].get_legend_handles_labels()
     h2, l2 = axs[0, 1]._ax_dt.get_legend_handles_labels()
     axs[0, 1].legend(h1 + h2, l1 + l2, loc="upper right", frameon=True, fontsize=leg_fs)
     axs[0, 0].legend(loc="upper right", frameon=True, fontsize=leg_fs)
-
-    if stage_patches:
-        axs[1, 0].legend(handles=stage_patches, loc="upper right", frameon=True, fontsize=leg_fs_stage)
 
     if cfg.use_fixed_ylims:
         y = cfg.ylims
@@ -1090,6 +1246,119 @@ def _legend_layout_from_style(style: Dict[str, Any]) -> Dict[str, Any]:
     )
 
 
+def _plotly_layout_meta(fig) -> Dict[str, Any]:
+    """Inspect figure layout for responsive margin sizing."""
+    y_title_lens: List[int] = []
+    has_secondary_y = False
+    has_x_title = False
+    layout = fig.layout
+    for key in layout:
+        ks = str(key)
+        if ks.startswith("yaxis"):
+            ax = layout[key]
+            if ax is None:
+                continue
+            title = ""
+            if getattr(ax, "title", None) and getattr(ax.title, "text", None):
+                title = str(ax.title.text)
+            if title:
+                plain = title.replace("<br>", " ").replace("<br/>", " ")
+                y_title_lens.append(len(plain))
+            if getattr(ax, "overlaying", None) or (
+                getattr(ax, "side", None) == "right" and ks != "yaxis"
+            ):
+                has_secondary_y = True
+        elif ks.startswith("xaxis"):
+            ax = layout[key]
+            if ax is not None and getattr(ax, "title", None) and getattr(ax.title, "text", None):
+                has_x_title = True
+    return {
+        "n_yaxes": max(1, len(y_title_lens)),
+        "n_traces": len(fig.data or []),
+        "max_y_title_len": max(y_title_lens) if y_title_lens else 0,
+        "has_secondary_y": has_secondary_y,
+        "has_x_title": has_x_title,
+    }
+
+
+def apply_responsive_plotly_layout(fig, style: Optional[Dict[str, Any]] = None) -> Any:
+    """Fit Plotly figures to container width; reduce label/legend clipping on narrow screens."""
+    if fig is None:
+        return fig
+    try:
+        meta = _plotly_layout_meta(fig)
+        style = style or {}
+        ncol = max(1, int(style.get("legend_ncol", 1)))
+        show_leg = bool(style.get("show_legend", True))
+
+        left = max(58, min(128, 48 + meta["max_y_title_len"] * 4))
+        if meta["n_yaxes"] >= 5:
+            left = max(left, 74)
+        elif meta["n_yaxes"] >= 3:
+            left = max(left, 66)
+
+        bottom = 54
+        if meta["has_x_title"]:
+            bottom += 6
+        if show_leg and ncol > 1:
+            bottom = max(bottom, 58 + 14 * min(ncol, 6))
+        elif show_leg and meta["n_traces"] > 10:
+            bottom = max(bottom, 64)
+
+        top = 64
+        if getattr(fig.layout, "title", None) and getattr(fig.layout.title, "text", None):
+            tit = str(fig.layout.title.text)
+            top = 90 if "<br" in tit.lower() else 72
+
+        right = 30
+        if meta["has_secondary_y"]:
+            right = max(right, 52)
+        if show_leg and meta["n_traces"] > 14:
+            right = max(right, 38)
+
+        fig.update_layout(
+            autosize=True,
+            width=None,
+            margin=dict(l=left, r=right, t=top, b=bottom, pad=2),
+        )
+        fig.update_yaxes(automargin=True, title_standoff=12)
+        fig.update_xaxes(automargin=True)
+    except Exception:
+        pass
+    return fig
+
+
+def show_plotly_chart(
+    fig,
+    stage_defs=None,
+    *,
+    show_stage_legend: bool = True,
+    external_series_legend: bool = False,
+    series_legend_title: str = "Sensors / series",
+) -> None:
+    """Display a Plotly figure at full column width with responsive resize."""
+    if fig is None:
+        return
+    st.plotly_chart(fig, width="stretch", config=PLOTLY_CHART_CONFIG)
+    if external_series_legend:
+        render_series_legend_outside(fig, title=series_legend_title)
+    if show_stage_legend and stage_defs:
+        render_stage_legend_outside(stage_defs)
+
+
+def show_matplotlib_fig(fig, stage_defs=None, *, show_stage_legend: bool = True) -> None:
+    """Display a Matplotlib figure with tight layout for narrow viewports."""
+    if fig is None:
+        return
+    try:
+        fig.tight_layout()
+    except Exception:
+        pass
+    st.pyplot(fig, width="stretch")
+    if show_stage_legend and stage_defs:
+        render_stage_legend_outside(stage_defs)
+
+
 def apply_plotly_style(fig, style: Dict[str, Any]) -> Any:
     """Apply fonts, grid, legend from a style dict (from per-page options)."""
     if fig is None:
@@ -1120,18 +1389,11 @@ def apply_plotly_style(fig, style: Dict[str, Any]) -> Any:
         fam_axis = "Arial Black" if bold_at else "Arial"
         fam_tick = "Arial Black" if bold_tick else "Arial"
 
-        _t_margin = 70
-        if getattr(fig.layout, "title", None) and getattr(fig.layout.title, "text", None):
-            _tit0 = str(fig.layout.title.text)
-            if "<br" in _tit0.lower():
-                _t_margin = 88
-
         layout_kw: Dict[str, Any] = dict(
             template="none",
             paper_bgcolor="white",
             plot_bgcolor="white",
             font=dict(size=fs_tick, color="black"),
-            margin=dict(l=50, r=30, t=_t_margin, b=50),
         )
         if show_leg:
             layout_kw["legend"] = _legend_layout_from_style(style)
@@ -1175,6 +1437,7 @@ def apply_plotly_style(fig, style: Dict[str, Any]) -> Any:
         )
         fig.update_xaxes(**axis_common)
         fig.update_yaxes(**axis_common)
+        apply_responsive_plotly_layout(fig, style)
     except Exception:
         pass
     return fig
@@ -1560,6 +1823,7 @@ def plot_zone_single_plotly(
     show_markers: bool = False,
     line_width: float = 2.0,
     marker_size: float = 6.0,
+    legend_in_plot: bool = True,
 ):
     _require_plotly()
     fig = go.Figure()
@@ -1570,23 +1834,23 @@ def plot_zone_single_plotly(
     lw = max(0.25, float(line_width))
     ms = max(1.0, float(marker_size))
     mode = "lines+markers" if show_markers else "lines"
-    for col in zone_df.columns:
+    fig.update_layout(colorway=list(_PLOTLY_SERIES_COLORS))
+    for i, col in enumerate(zone_df.columns):
         s = zone_df[col].dropna()
+        color = _series_color_for_index(i)
         fig.add_trace(
             go.Scatter(
                 x=s.index,
                 y=s.values,
                 mode=mode,
                 name=str(col),
-                line=dict(width=lw),
-                marker=dict(size=ms),
-                showlegend=True,
+                line=dict(width=lw, color=color),
+                marker=dict(size=ms, color=color),
+                showlegend=legend_in_plot,
             )
         )
 
-    if stage_defs:
-        for (name, stt, ett, colr) in stage_defs:
-            fig.add_vrect(x0=stt, x1=ett, fillcolor=colr, opacity=0.08, line_width=0)
+    add_plotly_stage_vrects(fig, stage_defs)
 
     if plot_start is not None and plot_end is not None:
         fig.update_xaxes(range=[plot_start, plot_end])
@@ -1598,7 +1862,7 @@ def plot_zone_single_plotly(
         xaxis_title="Time",
         yaxis_title=y_title,
         height=520,
-        showlegend=True,
+        showlegend=legend_in_plot,
     )
     return fig
 
@@ -1759,8 +2023,8 @@ def plot_overall_metrics_plotly(
         rows=5,
         cols=2,
         shared_xaxes=True,
-        vertical_spacing=0.03,
-        horizontal_spacing=0.08,
+        vertical_spacing=0.04,
+        horizontal_spacing=0.11,
         row_heights=[0.22, 0.20, 0.20, 0.19, 0.19],
         specs=[
             [{"secondary_y": False}, {"secondary_y": True}],
@@ -1855,10 +2119,8 @@ def plot_overall_metrics_plotly(
         secondary_y=True,
     )
 
-    # Stage shading (vrect) on all subplots
-    if stage_defs:
-        for (name, stt, ett, col) in stage_defs:
-            fig.add_vrect(x0=stt, x1=ett, fillcolor=col, opacity=0.08, line_width=0)
+    # Stage shading on all panels (legend rendered below chart via render_stage_legend_outside)
+    add_plotly_stage_vrects(fig, stage_defs)
 
     # Axes and ranges
     for i in range(1, 6):
@@ -2516,7 +2778,7 @@ with tab2:
 
     if go is None or make_subplots is None:
         st.warning("Plotly not installed; showing static matplotlib figure. To enable hover, run: pip install plotly")
-        st.pyplot(fig_overall, width="stretch")
+        show_matplotlib_fig(fig_overall, stage_defs)
     else:
         with st.expander("Plot options — Overall metrics", expanded=False):
             _ensure_widget_defaults("overall", OVERALL_PAGE_DEFAULTS)
@@ -2559,7 +2821,7 @@ with tab2:
         )
         apply_plotly_style(fig_overall_p, _style_from_prefix("overall"))
         fig_overall_p.update_xaxes(tickformat="%H:%M", hoverformat="%Y-%m-%d %H:%M:%S")
-        st.plotly_chart(fig_overall_p, width="stretch")
+        show_plotly_chart(fig_overall_p, stage_defs)
 
     st.write("---")
     st.write("**Overall metrics table (for export)**")
@@ -2602,7 +2864,7 @@ with tab3:
     st.write("This section compares selected CAVE walls against PK wall-level response (CO₂ and temperature).")
     if go is None or make_subplots is None:
         st.warning("Plotly not installed; showing static matplotlib figure. To enable hover, run: pip install plotly")
-        st.pyplot(fig_zone, width="stretch")
+        show_matplotlib_fig(fig_zone, stage_defs)
     else:
         dc_cave_co2 = zone_ts_page_defaults(cfg.ylims, "zone_cave_co2")
         dc_pk_co2 = zone_ts_page_defaults(cfg.ylims, "zone_pk_co2")
@@ -2678,8 +2940,8 @@ with tab3:
         )
         apply_plotly_style(fig_cave_zone_co2, _style_from_prefix("zco2_cave"))
         apply_plotly_style(fig_pk_zone_co2, _style_from_prefix("zco2_pk"))
-        st.plotly_chart(fig_cave_zone_co2, width="stretch")
-        st.plotly_chart(fig_pk_zone_co2, width="stretch")
+        show_plotly_chart(fig_cave_zone_co2, stage_defs, show_stage_legend=False)
+        show_plotly_chart(fig_pk_zone_co2, stage_defs)
 
     st.write("**CAVE zone mean preview**")
     st.dataframe(cave_zone_co2.head(20), use_container_width=True)
@@ -2692,7 +2954,7 @@ with tab3:
 
     if go is None or make_subplots is None:
         st.warning("Plotly not installed; showing static matplotlib figure for temperature. To enable hover, run: pip install plotly")
-        st.pyplot(fig_zone_T, width="stretch")
+        show_matplotlib_fig(fig_zone_T, stage_defs)
     else:
         with st.expander("Plot options — CAVE zone temperature", expanded=False):
             _ensure_widget_defaults("zt_cave", dc_cave_t)
@@ -2763,8 +3025,8 @@ with tab3:
         )
         apply_plotly_style(fig_cave_zone_temp, _style_from_prefix("zt_cave"))
         apply_plotly_style(fig_pk_zone_temp, _style_from_prefix("zt_pk"))
-        st.plotly_chart(fig_cave_zone_temp, width="stretch")
-        st.plotly_chart(fig_pk_zone_temp, width="stretch")
+        show_plotly_chart(fig_cave_zone_temp, stage_defs, show_stage_legend=False)
+        show_plotly_chart(fig_pk_zone_temp, stage_defs)
 
     st.write("**CAVE zone temperature preview**")
     st.dataframe(cave_zone_temp.head(20), use_container_width=True)
@@ -2809,6 +3071,8 @@ with tab4:
                 return
 
             st.markdown(f"### {region_label}")
+            if stage_defs:
+                render_stage_legend_outside(stage_defs)
             walls_avail = sorted(catalog["wall"].unique().tolist())
             default_wall_pick = [w for w in default_walls if w in walls_avail]
             if not default_wall_pick and walls_avail:
@@ -2942,9 +3206,17 @@ with tab4:
                         show_markers=mk,
                         line_width=lw_s,
                         marker_size=ms_s,
+                        legend_in_plot=False,
                     )
-                    apply_plotly_style(fig, _style_from_prefix(_pfx))
-                    st.plotly_chart(fig, width="stretch")
+                    _style = {**_style_from_prefix(_pfx), "show_legend": False}
+                    apply_plotly_style(fig, _style)
+                    show_plotly_chart(
+                        fig,
+                        stage_defs=None,
+                        show_stage_legend=False,
+                        external_series_legend=True,
+                        series_legend_title="Sensors",
+                    )
 
                 if one_per_zone:
                     walls_to_plot = picked_walls if picked_walls else sorted(
@@ -3223,7 +3495,7 @@ with tab5:
                 if go is None or make_subplots is None:
                     with c1:
                         st.write("**CAVE — CO₂**")
-                        st.pyplot(
+                        show_matplotlib_fig(
                             plot_vertical_profiles_matplotlib(
                                 cave_co2_profiles,
                                 _vertical_profile_title("CAVE — CO₂"),
@@ -3234,12 +3506,11 @@ with tab5:
                                 line_width=lw_cc,
                                 marker_size=ms_cc,
                                 legend_fontsize=leg_cc,
-                            ),
-                            width="stretch",
+                            )
                         )
                     with c2:
                         st.write("**CAVE — Temperature**")
-                        st.pyplot(
+                        show_matplotlib_fig(
                             plot_vertical_profiles_matplotlib(
                                 cave_T_profiles,
                                 _vertical_profile_title("CAVE — Temperature"),
@@ -3250,12 +3521,11 @@ with tab5:
                                 line_width=lw_ct,
                                 marker_size=ms_ct,
                                 legend_fontsize=leg_ct,
-                            ),
-                            width="stretch",
+                            )
                         )
                     with c3:
                         st.write("**PK — CO₂**")
-                        st.pyplot(
+                        show_matplotlib_fig(
                             plot_vertical_profiles_matplotlib(
                                 pk_co2_profiles,
                                 _vertical_profile_title("PK — CO₂"),
@@ -3266,12 +3536,11 @@ with tab5:
                                 line_width=lw_pc,
                                 marker_size=ms_pc,
                                 legend_fontsize=leg_pc,
-                            ),
-                            width="stretch",
+                            )
                         )
                     with c4:
                         st.write("**PK — Temperature**")
-                        st.pyplot(
+                        show_matplotlib_fig(
                             plot_vertical_profiles_matplotlib(
                                 pk_T_profiles,
                                 _vertical_profile_title("PK — Temperature"),
@@ -3282,8 +3551,7 @@ with tab5:
                                 line_width=lw_pt,
                                 marker_size=ms_pt,
                                 legend_fontsize=leg_pt,
-                            ),
-                            width="stretch",
+                            )
                         )
                 else:
                     fig_p_cc = plot_vertical_profiles_plotly(
@@ -3328,16 +3596,16 @@ with tab5:
                     apply_plotly_style(fig_p_pt, _style_from_prefix("prof_pt"))
                     with c1:
                         st.write("**CAVE — CO₂**")
-                        st.plotly_chart(fig_p_cc, width="stretch")
+                        show_plotly_chart(fig_p_cc)
                     with c2:
                         st.write("**CAVE — Temperature**")
-                        st.plotly_chart(fig_p_ct, width="stretch")
+                        show_plotly_chart(fig_p_ct)
                     with c3:
                         st.write("**PK — CO₂**")
-                        st.plotly_chart(fig_p_pc, width="stretch")
+                        show_plotly_chart(fig_p_pc)
                     with c4:
                         st.write("**PK — Temperature**")
-                        st.plotly_chart(fig_p_pt, width="stretch")
+                        show_plotly_chart(fig_p_pt)
 
                 st.write("---")
                 st.write("**Download profile data**")
@@ -3384,7 +3652,7 @@ with tab6:
     if fig_mfc is not None:
         st.write("**MFC quicklook**")
         if go is None:
-            st.pyplot(fig_mfc, width="stretch")
+            show_matplotlib_fig(fig_mfc)
         else:
             f_hi = float(mfc_df["F"].max()) if len(mfc_df) else 1.0
             mfc_def = {**MFC_WIDGET_DEFAULTS, "y_min": 0.0, "y_max": max(1.0, f_hi * 1.08)}
@@ -3429,7 +3697,7 @@ with tab6:
             )
             if fig_mfc_p is not None:
                 apply_plotly_style(fig_mfc_p, _style_from_prefix("mfc"))
-                st.plotly_chart(fig_mfc_p, width="stretch")
+                show_plotly_chart(fig_mfc_p)
 
     if mfc_summary is not None:
         st.write("**MFC summary**")
