@@ -5,9 +5,10 @@
 from __future__ import annotations
 
 import html
-import io
-import traceback
 import hashlib
+import io
+import re
+import traceback
 from dataclasses import dataclass
 from typing import Optional, List, Tuple, Dict, Any
 
@@ -128,6 +129,10 @@ def default_ylims():
         "temp_pk_minus_cave": (0, 25),
         "zone_cave_co2": (350, 1300),
         "zone_pk_co2": (350, 1300),
+        "rh_mean": (0, 100),
+        "rh_std": (0, 25),
+        "zone_cave_rh": (0, 100),
+        "zone_pk_rh": (0, 100),
         "io_ex": (0.0, 1.00),
         "scatter_cave_ex": (0, 600),
         "scatter_pk_ex": (0, 300),
@@ -201,6 +206,12 @@ def load_explora_any(file_bytes: bytes, filename: str) -> pd.DataFrame:
     df["temperature"] = pd.to_numeric(df["temperature"], errors="coerce")
     df["sensor_number"] = pd.to_numeric(df["sensor_number"], errors="coerce").astype("Int64")
 
+    hum_col = _detect_humidity_column(list(df.columns))
+    if hum_col is not None:
+        df["humidity"] = pd.to_numeric(df[hum_col], errors="coerce")
+        if hum_col != "humidity":
+            df.attrs["humidity_source_col"] = hum_col
+
     if "z" in df.columns:
         df["z"] = pd.to_numeric(df["z"], errors="coerce")
 
@@ -222,6 +233,34 @@ def load_explora_any(file_bytes: bytes, filename: str) -> pd.DataFrame:
     return df
 
 
+def _detect_humidity_column(columns) -> Optional[str]:
+    """Return Explora humidity column name (lowercase headers) if present."""
+    cols = [str(c).strip().lower() for c in columns]
+    lookup = {c: c for c in cols}
+    for key in (
+        "humidity",
+        "rh",
+        "relative humidity",
+        "relative_humidity",
+        "humidity_%",
+        "rh_%",
+        "humidity percent",
+        "humidity_percent",
+    ):
+        if key in lookup:
+            return lookup[key]
+    for c in cols:
+        if "humid" in c or c == "rh" or c.startswith("rh_") or c.endswith("_rh"):
+            return c
+    return None
+
+
+def humidity_has_data(df: Optional[pd.DataFrame]) -> bool:
+    if df is None or df.empty or "humidity" not in df.columns:
+        return False
+    return bool(df["humidity"].notna().any())
+
+
 @st.cache_data(show_spinner=False)
 def load_stages_from_log(file_bytes: bytes, filename: str, sheet="Summary Experiment Stages"):
     bio = io.BytesIO(file_bytes)
@@ -239,19 +278,133 @@ def load_stages_from_log(file_bytes: bytes, filename: str, sheet="Summary Experi
     return rows
 
 
+def _clean_mfc_column_name(name: str) -> str:
+    return str(name).strip().lstrip("\ufeff").strip()
+
+
+def _find_mfc_column(columns, *candidates: str) -> Optional[str]:
+    """Case-insensitive MFC column lookup (handles BOM / stray spaces)."""
+    lookup = {_clean_mfc_column_name(c).lower(): c for c in columns}
+    for cand in candidates:
+        key = _clean_mfc_column_name(cand).lower()
+        if key in lookup:
+            return lookup[key]
+    return None
+
+
+def _normalize_mfc_col_key(name: str) -> str:
+    s = _clean_mfc_column_name(name).lower()
+    s = re.sub(r"\([^)]*\)|\[[^\]]*\]", "", s)
+    s = re.sub(r"[\s_\-.°]+", "", s)
+    return re.sub(r"[^a-z0-9]", "", s)
+
+
+_MFC_TEMP_EXCLUDE_NORM = frozenset(
+    {
+        "timestamp",
+        "time",
+        "datetime",
+        "date",
+        "fsetpoint",
+        "fmeasure",
+        "fset",
+        "fmeas",
+        "flow",
+        "flowrate",
+        "flowsetpoint",
+        "flowmeasure",
+        "setpoint",
+        "measure",
+    }
+)
+
+
+def _detect_mfc_temperature_column(columns) -> Optional[str]:
+    """Return the raw MFC CSV column name for temperature, if present."""
+    cols = list(columns)
+    lower = {_clean_mfc_column_name(c).lower(): c for c in cols}
+    for key in (
+        "temperature",
+        "temp",
+        "mfc_temperature",
+        "mfc temp",
+        "t_mfc",
+        "t_c",
+        "gas temperature",
+        "gas temp",
+        "cylinder temperature",
+        "cylinder temp",
+    ):
+        if key in lower:
+            return lower[key]
+
+    norm_map: Dict[str, str] = {}
+    for c in cols:
+        nk = _normalize_mfc_col_key(c)
+        if nk and nk not in norm_map:
+            norm_map[nk] = c
+
+    for key in (
+        "temperature",
+        "temp",
+        "mfctemperature",
+        "gastemperature",
+        "gastemp",
+        "cylindertemperature",
+        "cylindertemp",
+        "tmfc",
+        "tc",
+    ):
+        if key in norm_map:
+            return norm_map[key]
+
+    for nk, orig in norm_map.items():
+        if nk in _MFC_TEMP_EXCLUDE_NORM:
+            continue
+        if "temp" in nk or nk in ("t", "tc", "tmfc"):
+            return orig
+    return None
+
+
+def _parse_mfc_numeric_series(series: pd.Series) -> pd.Series:
+    """Parse numeric MFC fields; tolerate unit suffixes like '25.3 C' or '25,3'."""
+    if pd.api.types.is_numeric_dtype(series):
+        return pd.to_numeric(series, errors="coerce")
+    as_str = series.astype(str).str.strip()
+    as_str = as_str.str.replace(",", ".", regex=False)
+    extracted = as_str.str.extract(r"([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)", expand=False)
+    return pd.to_numeric(extracted, errors="coerce")
+
+
+def mfc_has_temperature(mfc_df: Optional[pd.DataFrame]) -> bool:
+    if mfc_df is None or mfc_df.empty or "T" not in mfc_df.columns:
+        return False
+    return bool(mfc_df["T"].notna().any())
+
+
 @st.cache_data(show_spinner=False)
 def load_mfc_csv(file_bytes: bytes, filename: str) -> pd.DataFrame:
     bio = io.BytesIO(file_bytes)
     dfm = pd.read_csv(bio)
+    dfm.columns = [_clean_mfc_column_name(c) for c in dfm.columns]
 
-    needed = ["Timestamp", "Fsetpoint", "Fmeasure"]
-    for c in needed:
-        if c not in dfm.columns:
-            raise ValueError(f"MFC missing '{c}'. Columns: {list(dfm.columns)}")
+    ts_col = _find_mfc_column(dfm.columns, "Timestamp", "Time", "DateTime", "Date time")
+    fset_col = _find_mfc_column(dfm.columns, "Fsetpoint", "F setpoint", "Flow setpoint")
+    fmeas_col = _find_mfc_column(dfm.columns, "Fmeasure", "F measure", "Flow measure")
+    missing = [
+        label
+        for label, col in (("Timestamp", ts_col), ("Fsetpoint", fset_col), ("Fmeasure", fmeas_col))
+        if col is None
+    ]
+    if missing:
+        raise ValueError(f"MFC missing {missing}. Columns: {list(dfm.columns)}")
 
-    dfm["t"] = pd.to_datetime(dfm["Timestamp"], errors="coerce")
-    dfm["Fset"] = pd.to_numeric(dfm["Fsetpoint"], errors="coerce")
-    dfm["Fmeas"] = pd.to_numeric(dfm["Fmeasure"], errors="coerce")
+    dfm["t"] = pd.to_datetime(dfm[ts_col], errors="coerce", dayfirst=True)
+    dfm["Fset"] = _parse_mfc_numeric_series(dfm[fset_col])
+    dfm["Fmeas"] = _parse_mfc_numeric_series(dfm[fmeas_col])
+    temp_col = _detect_mfc_temperature_column(dfm.columns)
+    if temp_col is not None:
+        dfm["T"] = _parse_mfc_numeric_series(dfm[temp_col])
     dfm = (
         dfm.dropna(subset=["t"])
         .sort_values("t")
@@ -259,6 +412,8 @@ def load_mfc_csv(file_bytes: bytes, filename: str) -> pd.DataFrame:
         .reset_index(drop=True)
     )
     dfm["F"] = dfm["Fmeas"].fillna(dfm["Fset"])
+    if temp_col is not None:
+        dfm.attrs["temp_source_col"] = temp_col
     return dfm
 
 
@@ -407,6 +562,28 @@ def compute_temp_metrics(df_region: pd.DataFrame, align_to: str, min_sensors: in
         "r2_Tz": r2_Tz,
         "mi_T": mi_T,
     }
+
+
+def compute_humidity_metrics(df_region: pd.DataFrame, align_to: str, min_sensors: int):
+    """Region-level humidity time series (mean, std, CV, mixing index)."""
+    if not humidity_has_data(df_region):
+        empty = pd.Series(dtype=float)
+        return {"n": empty, "mean": empty, "std": empty, "cv": empty, "mi": empty}
+
+    d = df_region.dropna(subset=["time", "humidity"]).copy()
+    d["tbin"] = d["time"].dt.floor(align_to)
+    g = d.groupby("tbin")
+    n = g["sensor_number"].nunique()
+    mean = g["humidity"].mean()
+    std = g["humidity"].std()
+    cv = std / mean
+    mi = 1 - cv
+    ok = n >= min_sensors
+    mean = mean.where(ok)
+    std = std.where(ok)
+    cv = cv.where(ok)
+    mi = mi.where(ok)
+    return {"n": n, "mean": mean, "std": std, "cv": cv, "mi": mi}
 
 
 def zone_mean_timeseries(df_region: pd.DataFrame, zone_col: str, zones, value_col: str, align_to: str, min_sensors: int):
@@ -1116,18 +1293,43 @@ def plot_zone_temp(
 def plot_mfc(mfc_df, t_on, t_off, t_rel0, t_rel1, cfg: AppConfig, *, line_width: float = 2.2, legend_fontsize: int = 10):
     lw = float(line_width)
     leg_fs = max(5, min(24, int(legend_fontsize)))
+    has_temp = mfc_has_temperature(mfc_df)
     fig, ax = plt.subplots(figsize=(14, 4.8))
-    ax.plot(mfc_df["t"], mfc_df["F"], linewidth=lw, label="MFC flow (Fmeas if available else Fset)")
-    ax.axhline(cfg.flow_on_th, linestyle=":", linewidth=max(1.0, lw * 0.85), label=f"FLOW_ON_TH={cfg.flow_on_th}")
+    ax.plot(
+        mfc_df["t"],
+        mfc_df["F"],
+        linewidth=lw,
+        color="#1f77b4",
+        label="MFC flow (Fmeas if available else Fset)",
+    )
+    ax.axhline(cfg.flow_on_th, linestyle=":", linewidth=max(1.0, lw * 0.85), color="#444444", label=f"FLOW_ON_TH={cfg.flow_on_th}")
+
+    ax2 = None
+    if has_temp:
+        ax2 = ax.twinx()
+        ax2.plot(
+            mfc_df["t"],
+            mfc_df["T"],
+            linewidth=lw,
+            color="#d62728",
+            linestyle="-",
+            label="Temperature (°C)",
+        )
+        ax2.set_ylabel("Temperature (°C)", fontsize=12, fontweight="bold", color="#d62728")
+        ax2.tick_params(axis="y", labelcolor="#d62728")
 
     if (t_on is not None) and (t_off is not None):
-        ax.axvspan(t_on, t_off, alpha=0.15, label="Detected release (F>TH)")
+        ax.axvspan(t_on, t_off, alpha=0.15, color="green", label="Detected release (F>TH)")
 
     if (t_rel0 is not None) and (t_rel1 is not None):
-        ax.axvspan(t_rel0, t_rel1, alpha=0.10, label="Stage2 (Release)")
+        ax.axvspan(t_rel0, t_rel1, alpha=0.10, color="orange", label="Stage2 (Release)")
 
-    ax.set_title(f"{cfg.exp_code} — MFC Release Quicklook", fontsize=12, fontweight="bold")
-    ax.set_ylabel("Flow (MFC units)", fontsize=12, fontweight="bold")
+    title = f"{cfg.exp_code} — MFC Release Quicklook"
+    if has_temp:
+        title += " (flow + temperature)"
+    ax.set_title(title, fontsize=12, fontweight="bold")
+    ax.set_ylabel("Flow (MFC units)", fontsize=12, fontweight="bold", color="#1f77b4")
+    ax.tick_params(axis="y", labelcolor="#1f77b4")
     ax.set_xlabel("Time", fontsize=12, fontweight="bold")
     ax.grid(True)
     ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
@@ -1136,7 +1338,12 @@ def plot_mfc(mfc_df, t_on, t_off, t_rel0, t_rel1, cfg: AppConfig, *, line_width:
     if (t_rel0 is not None) and (t_rel1 is not None):
         ax.set_xlim(t_rel0, t_rel1)
 
-    ax.legend(frameon=True, fontsize=leg_fs, loc="upper right")
+    h1, l1 = ax.get_legend_handles_labels()
+    if ax2 is not None:
+        h2, l2 = ax2.get_legend_handles_labels()
+        ax.legend(h1 + h2, l1 + l2, frameon=True, fontsize=leg_fs, loc="upper right")
+    else:
+        ax.legend(frameon=True, fontsize=leg_fs, loc="upper right")
     plt.tight_layout()
     return fig
 
@@ -1436,7 +1643,16 @@ def apply_plotly_style(fig, style: Dict[str, Any]) -> Any:
             automargin=True,
         )
         fig.update_xaxes(**axis_common)
-        fig.update_yaxes(**axis_common)
+        yaxis2 = getattr(fig.layout, "yaxis2", None)
+        has_overlay_y2 = bool(
+            yaxis2 is not None and getattr(yaxis2, "overlaying", None)
+        )
+        if has_overlay_y2:
+            y2_grid = dict(showgrid=False)
+            fig.update_yaxes(**axis_common)
+            fig.update_layout(yaxis2=y2_grid)
+        else:
+            fig.update_yaxes(**axis_common)
         apply_responsive_plotly_layout(fig, style)
     except Exception:
         pass
@@ -1725,6 +1941,11 @@ OVERALL_Y_KEYS = [
     ("temp_pk_minus_cave", "ΔT PK−CAVE"),
 ]
 
+RH_OVERVIEW_Y_KEYS = [
+    ("rh_mean", "Mean RH (%)"),
+    ("rh_std", "Std RH (%)"),
+]
+
 OVERALL_WIDGET_DEFAULTS: Dict[str, Any] = {
     "title_fs": 18,
     "title_bold": True,
@@ -1782,6 +2003,12 @@ MFC_WIDGET_DEFAULTS: Dict[str, Any] = {
     "y_max": 1.0,
     "use_custom_y": False,
     "line_width": 3.0,
+}
+
+RH_PAGE_DEFAULTS: Dict[str, Any] = {
+    **ZONE_WIDGET_DEFAULTS,
+    **{f"y_{k}_min": default_ylims()[k][0] for k, _ in RH_OVERVIEW_Y_KEYS},
+    **{f"y_{k}_max": default_ylims()[k][1] for k, _ in RH_OVERVIEW_Y_KEYS},
 }
 
 _ylim0 = default_ylims()
@@ -2302,6 +2529,71 @@ def plot_zone_temp_plotly(cave_zone_temp, pk_zone_temp, stage_defs, cfg: AppConf
     return fig
 
 
+def plot_humidity_overview_plotly(
+    rh_cave,
+    rh_pk,
+    stage_defs,
+    cfg: AppConfig,
+    plot_start,
+    plot_end,
+    ylims_src: Optional[Dict[str, Tuple[float, float]]] = None,
+    use_fixed_y: bool = True,
+    line_width: float = 2.0,
+):
+    _require_plotly()
+    if make_subplots is None:
+        raise RuntimeError("Plotly subplots not available")
+
+    lw_c = max(0.25, float(line_width) * 1.5)
+    lw_p = max(0.25, float(line_width) * 1.0)
+    cave_color = "#1f77b4"
+    pk_color = "#ff7f0e"
+
+    fig = make_subplots(
+        rows=2,
+        cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.10,
+        subplot_titles=("Mean relative humidity (%)", "Std relative humidity (%)"),
+    )
+
+    panels = [("mean", 1), ("std", 2)]
+    for metric, row in panels:
+        s_c = rh_cave[metric].dropna()
+        s_p = rh_pk[metric].dropna()
+        fig.add_trace(
+            go.Scatter(
+                x=s_c.index, y=s_c.values, mode="lines", name="CAVE",
+                line=dict(width=lw_c, color=cave_color), legendgroup="CAVE", showlegend=(row == 1),
+            ),
+            row=row, col=1,
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=s_p.index, y=s_p.values, mode="lines", name="PK",
+                line=dict(width=lw_p, dash="dash", color=pk_color), legendgroup="PK", showlegend=(row == 1),
+            ),
+            row=row, col=1,
+        )
+        fig.update_yaxes(title_text="RH (%)" if metric == "mean" else "Std (%)", row=row, col=1)
+
+    add_plotly_stage_vrects(fig, stage_defs)
+    if plot_start is not None and plot_end is not None:
+        fig.update_xaxes(range=[plot_start, plot_end])
+    yref = ylims_src if ylims_src is not None else cfg.ylims
+    if use_fixed_y and yref is not None:
+        fig.update_yaxes(range=list(yref["rh_mean"]), row=1, col=1)
+        fig.update_yaxes(range=list(yref["rh_std"]), row=2, col=1)
+
+    fig.update_layout(
+        height=620,
+        title=f"{cfg.exp_code} — Humidity overview (CAVE vs PK)",
+        showlegend=True,
+    )
+    fig.update_xaxes(tickformat="%H:%M", hoverformat="%Y-%m-%d %H:%M:%S", row=2, col=1)
+    return fig
+
+
 def plot_mfc_plotly(
     mfc_df,
     t_on,
@@ -2320,6 +2612,10 @@ def plot_mfc_plotly(
         return None
 
     lw = max(0.25, float(line_width))
+    has_temp = mfc_has_temperature(mfc_df)
+    flow_color = "#1f77b4"
+    temp_color = "#d62728"
+
     fig = go.Figure()
     fig.add_trace(
         go.Scatter(
@@ -2327,11 +2623,30 @@ def plot_mfc_plotly(
             y=mfc_df["F"],
             mode="lines",
             name="MFC flow (Fmeas if available else Fset)",
-            line=dict(width=lw),
+            line=dict(width=lw, color=flow_color),
+            yaxis="y",
         )
     )
 
-    fig.add_hline(y=cfg.flow_on_th, line_dash="dot", line_width=max(1.0, lw * 0.85), annotation_text=f"FLOW_ON_TH={cfg.flow_on_th}")
+    if has_temp:
+        fig.add_trace(
+            go.Scatter(
+                x=mfc_df["t"],
+                y=mfc_df["T"],
+                mode="lines",
+                name="Temperature (°C)",
+                line=dict(width=lw, color=temp_color),
+                yaxis="y2",
+            )
+        )
+
+    fig.add_hline(
+        y=cfg.flow_on_th,
+        line_dash="dot",
+        line_width=max(1.0, lw * 0.85),
+        line_color="#444444",
+        annotation_text=f"FLOW_ON_TH={cfg.flow_on_th}",
+    )
 
     if (t_on is not None) and (t_off is not None):
         fig.add_vrect(x0=t_on, x1=t_off, fillcolor="green", opacity=0.15, line_width=0)
@@ -2344,16 +2659,34 @@ def plot_mfc_plotly(
     elif lock_x_release and (t_rel0 is not None) and (t_rel1 is not None):
         fig.update_xaxes(range=[t_rel0, t_rel1])
 
-    if y_range is not None:
-        fig.update_yaxes(range=list(y_range))
-
-    fig.update_layout(
-        title=f"{cfg.exp_code} — MFC Release Quicklook",
+    layout_kw: Dict[str, Any] = dict(
+        title=f"{cfg.exp_code} — MFC Release Quicklook" + (" (flow + temperature)" if has_temp else ""),
         xaxis_title="Time",
-        yaxis_title="Flow (MFC units)",
+        yaxis=dict(
+            title=dict(text="Flow (MFC units)", font=dict(color=flow_color)),
+            tickfont=dict(color=flow_color),
+            side="left",
+        ),
         template="plotly_white",
         height=520,
     )
+    if has_temp:
+        t_valid = mfc_df["T"].dropna()
+        t_pad = (float(t_valid.max()) - float(t_valid.min())) * 0.05 if len(t_valid) else 1.0
+        if not np.isfinite(t_pad) or t_pad <= 0:
+            t_pad = 1.0
+        layout_kw["yaxis2"] = dict(
+            title=dict(text="Temperature (°C)", font=dict(color=temp_color)),
+            tickfont=dict(color=temp_color),
+            overlaying="y",
+            side="right",
+            showgrid=False,
+            range=[float(t_valid.min()) - t_pad, float(t_valid.max()) + t_pad] if len(t_valid) else None,
+        )
+    fig.update_layout(**layout_kw)
+
+    if y_range is not None:
+        fig.update_layout(yaxis=dict(range=list(y_range)))
 
     return fig
 # =========================================================
@@ -2615,6 +2948,29 @@ try:
             min_sensors=1,
         )
 
+        has_rh_data = humidity_has_data(df)
+        rh_cave = rh_pk = None
+        cave_zone_rh = pk_zone_rh = None
+        if has_rh_data:
+            rh_cave = compute_humidity_metrics(df_cave, cfg.align_to, cfg.min_sensors)
+            rh_pk = compute_humidity_metrics(df_pk, cfg.align_to, cfg.min_sensors)
+            cave_zone_rh = zone_mean_timeseries(
+                df_cave,
+                zone_col="wall",
+                zones=list(cfg.cave_walls_to_plot),
+                value_col="humidity",
+                align_to=cfg.align_to,
+                min_sensors=1,
+            )
+            pk_zone_rh = zone_mean_timeseries(
+                df_pk,
+                zone_col="wall",
+                zones=pk_zones_auto,
+                value_col="humidity",
+                align_to=cfg.align_to,
+                min_sensors=1,
+            )
+
         # Simple release window based on stages (for MFC quicklook only)
         t_rel0 = t_rel1 = None
         rel_note = "no release stage"
@@ -2731,12 +3087,13 @@ except Exception as e:
 # =========================================================
 # Tabs
 # =========================================================
-tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(
+tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs(
     [
         "Data Preview",
         "Overall Metrics",
         "Zone CO₂ & Temperature",
         "Sensor CO₂ & Temp",
+        "Humidity",
         "Vertical Profiles (Decay)",
         "MFC (optional)",
         "Export",
@@ -2757,6 +3114,10 @@ with tab1:
 
     st.write("**Columns**")
     st.write(list(df.columns))
+    if humidity_has_data(df):
+        src = df.attrs.get("humidity_source_col", "humidity")
+        n_rh = int(df["humidity"].notna().sum())
+        st.caption(f"Humidity data available — source column **{src}** ({n_rh:,} valid readings). See **Humidity** tab.")
 
     if stage_defs:
         st.write("**Detected stages**")
@@ -3277,6 +3638,355 @@ with tab4:
             )
 
 with tab5:
+    st.subheader("Humidity analysis")
+    st.write(
+        "Relative humidity (**RH**) from the Explora upload when a humidity column is present. "
+        "Use the sections below for region overview, wall-level zones, and individual sensors."
+    )
+
+    if not has_rh_data:
+        st.warning(
+            "No humidity column found in the Explora file. "
+            "Expected headers such as **humidity**, **rh**, or **relative humidity**. "
+            "Other tabs are unchanged."
+        )
+    else:
+        rh_src = df.attrs.get("humidity_source_col", "humidity")
+        st.caption(f"Using Explora column **{rh_src}** ({int(df['humidity'].notna().sum()):,} valid readings).")
+
+        rh_overview_tab, rh_zone_tab, rh_sensor_tab = st.tabs(
+            ["Overview", "Zone analysis", "Sensor level"]
+        )
+
+        with rh_overview_tab:
+            st.markdown("### CAVE vs PK — regional humidity")
+            c1, c2, c3 = st.columns(3)
+            c1.metric(
+                "CAVE mean RH (avg)",
+                f"{rh_cave['mean'].mean(skipna=True):.1f} %"
+                if rh_cave is not None and rh_cave["mean"].notna().any()
+                else "NA",
+            )
+            c2.metric(
+                "PK mean RH (avg)",
+                f"{rh_pk['mean'].mean(skipna=True):.1f} %"
+                if rh_pk is not None and rh_pk["mean"].notna().any()
+                else "NA",
+            )
+            c3.metric("Min sensors (setting)", f"{cfg.min_sensors}")
+
+            if go is None or make_subplots is None:
+                st.warning("Plotly not installed; humidity overview requires Plotly.")
+            else:
+                rh_def = {**RH_PAGE_DEFAULTS, "use_fixed_y": True}
+                with st.expander("Plot options — Humidity overview", expanded=False):
+                    _ensure_widget_defaults("rh_ov", rh_def)
+                    render_save_reset_row("rh_ov", rh_def)
+                    render_font_legend_widgets("rh_ov")
+                    render_series_line_marker_widgets("rh_ov")
+                    st.checkbox("Use fixed y-limits", key="rh_ov__use_fixed_y")
+                    with st.expander("Y-axis limits (per panel)", expanded=False):
+                        for key, label in RH_OVERVIEW_Y_KEYS:
+                            c1, c2 = st.columns(2)
+                            with c1:
+                                st.number_input(f"{label} — min", key=f"rh_ov__y_{key}_min")
+                            with c2:
+                                st.number_input(f"{label} — max", key=f"rh_ov__y_{key}_max")
+                    st.markdown("**X-axis (time)**")
+                    render_x_mode_widgets("rh_ov", t0, t1, stage_defs)
+
+                x0, x1 = render_x_controls("rh_ov", t0, t1, stage_defs)
+                y_merged = _collect_ylims_from_prefix("rh_ov", RH_OVERVIEW_Y_KEYS, default_ylims())
+                use_fy = bool(st.session_state.get("rh_ov__use_fixed_y", True))
+                lw_rh, _ = _line_marker_from_prefix("rh_ov")
+                fig_rh_ov = plot_humidity_overview_plotly(
+                    rh_cave,
+                    rh_pk,
+                    stage_defs,
+                    cfg,
+                    x0,
+                    x1,
+                    ylims_src=y_merged,
+                    use_fixed_y=use_fy,
+                    line_width=lw_rh,
+                )
+                apply_plotly_style(fig_rh_ov, _style_from_prefix("rh_ov"))
+                show_plotly_chart(fig_rh_ov, stage_defs)
+
+            st.write("**Summary table**")
+            rh_summary = {
+                "rh_cave_mean_avg_pct": float(rh_cave["mean"].mean(skipna=True)),
+                "rh_pk_mean_avg_pct": float(rh_pk["mean"].mean(skipna=True)),
+                "rh_cave_std_avg": float(rh_cave["std"].mean(skipna=True)),
+                "rh_pk_std_avg": float(rh_pk["std"].mean(skipna=True)),
+            }
+            st.dataframe(build_summary_df(rh_summary), use_container_width=True)
+
+        with rh_zone_tab:
+            st.markdown("### Wall / zone mean relative humidity")
+            if go is None:
+                st.warning("Plotly not installed.")
+            else:
+                dc_cave_rh = zone_ts_page_defaults(cfg.ylims, "zone_cave_rh")
+                dc_pk_rh = zone_ts_page_defaults(cfg.ylims, "zone_pk_rh")
+
+                with st.expander("Plot options — CAVE zone RH", expanded=False):
+                    _ensure_widget_defaults("rhz_cave", dc_cave_rh)
+                    render_save_reset_row("rhz_cave", dc_cave_rh)
+                    render_font_legend_widgets("rhz_cave")
+                    render_series_line_marker_widgets("rhz_cave")
+                    st.checkbox("Use fixed y-limits", key="rhz_cave__use_fixed_y")
+                    c1, c2 = st.columns(2)
+                    with c1:
+                        st.number_input("Y min", key="rhz_cave__y_min")
+                    with c2:
+                        st.number_input("Y max", key="rhz_cave__y_max")
+                    st.checkbox("Show markers", key="rhz_cave__show_markers")
+                    render_x_mode_widgets("rhz_cave", t0, t1, stage_defs)
+
+                with st.expander("Plot options — PK zone RH", expanded=False):
+                    _ensure_widget_defaults("rhz_pk", dc_pk_rh)
+                    render_save_reset_row("rhz_pk", dc_pk_rh)
+                    render_font_legend_widgets("rhz_pk")
+                    render_series_line_marker_widgets("rhz_pk")
+                    st.checkbox("Use fixed y-limits", key="rhz_pk__use_fixed_y")
+                    c1, c2 = st.columns(2)
+                    with c1:
+                        st.number_input("Y min", key="rhz_pk__y_min")
+                    with c2:
+                        st.number_input("Y max", key="rhz_pk__y_max")
+                    st.checkbox("Show markers", key="rhz_pk__show_markers")
+                    render_x_mode_widgets("rhz_pk", t0, t1, stage_defs)
+
+                xa_c0, xa_c1 = render_x_controls("rhz_cave", t0, t1, stage_defs)
+                xa_p0, xa_p1 = render_x_controls("rhz_pk", t0, t1, stage_defs)
+                lw_c, ms_c = _line_marker_from_prefix("rhz_cave")
+                lw_p, ms_p = _line_marker_from_prefix("rhz_pk")
+
+                def _zone_rh_plot(zone_df, title, pfx, xa0, xa1, ykey):
+                    uy = bool(st.session_state.get(f"{pfx}__use_fixed_y", True))
+                    ylo, yhi = _y_pair_from_prefix(pfx, cfg.ylims[ykey][0], cfg.ylims[ykey][1])
+                    y_r = (ylo, yhi) if uy else None
+                    mk = bool(st.session_state.get(f"{pfx}__show_markers", False))
+                    lw, ms = _line_marker_from_prefix(pfx)
+                    fig = plot_zone_single_plotly(
+                        zone_df,
+                        title=title,
+                        y_title="Relative humidity (%)",
+                        stage_defs=stage_defs,
+                        plot_start=xa0,
+                        plot_end=xa1,
+                        y_range=y_r,
+                        show_markers=mk,
+                        line_width=lw,
+                        marker_size=ms,
+                        legend_in_plot=False,
+                    )
+                    apply_plotly_style(fig, {**_style_from_prefix(pfx), "show_legend": False})
+                    show_plotly_chart(
+                        fig,
+                        stage_defs,
+                        show_stage_legend=False,
+                        external_series_legend=True,
+                        series_legend_title="Zones / walls",
+                    )
+
+                if stage_defs:
+                    render_stage_legend_outside(stage_defs)
+                _zone_rh_plot(
+                    cave_zone_rh,
+                    f"{cfg.exp_code} — CAVE zone RH",
+                    "rhz_cave",
+                    xa_c0,
+                    xa_c1,
+                    "zone_cave_rh",
+                )
+                _zone_rh_plot(
+                    pk_zone_rh,
+                    f"{cfg.exp_code} — PK zone RH",
+                    "rhz_pk",
+                    xa_p0,
+                    xa_p1,
+                    "zone_pk_rh",
+                )
+
+            st.write("**Zone RH preview**")
+            c1, c2 = st.columns(2)
+            with c1:
+                st.caption("CAVE")
+                st.dataframe(cave_zone_rh.head(20), use_container_width=True)
+            with c2:
+                st.caption("PK")
+                st.dataframe(pk_zone_rh.head(20), use_container_width=True)
+
+        with rh_sensor_tab:
+            st.markdown("### Sensor-level relative humidity")
+
+            def _render_rh_sensor_block(region_label, df_region, catalog, plot_prefix, default_walls):
+                if len(catalog) == 0:
+                    st.info(f"No {region_label} sensors in the current dataset.")
+                    return
+                st.markdown(f"#### {region_label}")
+                if stage_defs:
+                    render_stage_legend_outside(stage_defs)
+                walls_avail = sorted(catalog["wall"].unique().tolist())
+                default_wall_pick = [w for w in default_walls if w in walls_avail]
+                if not default_wall_pick and walls_avail:
+                    default_wall_pick = walls_avail[: min(2, len(walls_avail))]
+
+                zc1, zc2, zc3 = st.columns([2, 1, 1])
+                with zc1:
+                    picked_walls = st.multiselect(
+                        f"{region_label} — zones (walls)",
+                        options=walls_avail,
+                        default=default_wall_pick,
+                        key=f"{plot_prefix}__walls",
+                    )
+                with zc2:
+                    st.write("")
+                    st.write("")
+                    if st.button("Add sensors from zones", key=f"{plot_prefix}__add_zone_sensors"):
+                        zone_sns = sensors_in_walls(catalog, picked_walls)
+                        cur = set(int(x) for x in st.session_state.get(f"{plot_prefix}__sensor_ms", []))
+                        st.session_state[f"{plot_prefix}__sensor_ms"] = sorted(cur | set(zone_sns))
+                with zc3:
+                    st.write("")
+                    st.write("")
+                    if st.button("Clear selection", key=f"{plot_prefix}__clear_sensors"):
+                        st.session_state[f"{plot_prefix}__sensor_ms"] = []
+
+                sensor_options = catalog["sensor_number"].astype(int).tolist()
+                opt_labels = {
+                    int(r["sensor_number"]): _sensor_series_label(
+                        int(r["sensor_number"]),
+                        str(r["wall"]),
+                        float(r["z_median"]) if pd.notna(r["z_median"]) else np.nan,
+                    )
+                    for _, r in catalog.iterrows()
+                }
+                ms_key = f"{plot_prefix}__sensor_ms"
+                if ms_key not in st.session_state:
+                    st.session_state[ms_key] = []
+                picked_sensors = [
+                    int(s)
+                    for s in st.multiselect(
+                        f"{region_label} — sensors",
+                        options=sensor_options,
+                        format_func=lambda sid: opt_labels.get(int(sid), f"S{sid}"),
+                        key=ms_key,
+                    )
+                ]
+                if not picked_sensors:
+                    st.info(f"Select at least one {region_label} sensor.")
+                    return
+
+                pfx = f"{plot_prefix}_rh"
+                dc = {**ZONE_WIDGET_DEFAULTS, "y_min": 0.0, "y_max": 100.0, "use_fixed_y": False, "show_markers": False}
+                with st.expander(f"Plot options — {region_label} sensor RH", expanded=False):
+                    _ensure_widget_defaults(pfx, dc)
+                    render_save_reset_row(pfx, dc)
+                    render_font_legend_widgets(pfx)
+                    render_series_line_marker_widgets(pfx)
+                    st.checkbox("Use fixed y-limits", key=f"{pfx}__use_fixed_y")
+                    cya, cyb = st.columns(2)
+                    with cya:
+                        st.number_input("Y min", key=f"{pfx}__y_min")
+                    with cyb:
+                        st.number_input("Y max", key=f"{pfx}__y_max")
+                    st.checkbox("Show markers", key=f"{pfx}__show_markers")
+                    render_x_mode_widgets(pfx, t0, t1, stage_defs)
+
+                xa0, xa1 = render_x_controls(pfx, t0, t1, stage_defs)
+                uy = bool(st.session_state.get(f"{pfx}__use_fixed_y", False))
+                ylo, yhi = _y_pair_from_prefix(pfx, 0.0, 100.0)
+                y_r = (ylo, yhi) if uy else None
+                mk = bool(st.session_state.get(f"{pfx}__show_markers", False))
+                lw_s, ms_s = _line_marker_from_prefix(pfx)
+
+                layout_mode = st.session_state.get("rh_scmp_layout_mode", "All selected sensors on one chart")
+                one_per_zone = str(layout_mode).startswith("One chart")
+
+                if one_per_zone:
+                    walls_to_plot = picked_walls if picked_walls else sorted(
+                        catalog.loc[catalog["sensor_number"].isin(picked_sensors), "wall"].unique().tolist()
+                    )
+                    for wall in walls_to_plot:
+                        sns_wall = [
+                            int(s)
+                            for s in picked_sensors
+                            if int(s) in set(sensors_in_walls(catalog, [wall]))
+                        ]
+                        if not sns_wall:
+                            continue
+                        ts_w = sensor_value_timeseries(
+                            df_region, sns_wall, cfg.align_to, "humidity", catalog=catalog
+                        )
+                        if ts_w.empty:
+                            continue
+                        fig = plot_zone_single_plotly(
+                            ts_w,
+                            title=f"{cfg.exp_code} — {region_label} — {wall} — RH",
+                            y_title="Relative humidity (%)",
+                            stage_defs=stage_defs,
+                            plot_start=xa0,
+                            plot_end=xa1,
+                            y_range=y_r,
+                            show_markers=mk,
+                            line_width=lw_s,
+                            marker_size=ms_s,
+                            legend_in_plot=False,
+                        )
+                        apply_plotly_style(fig, {**_style_from_prefix(pfx), "show_legend": False})
+                        show_plotly_chart(
+                            fig, None, show_stage_legend=False,
+                            external_series_legend=True, series_legend_title="Sensors",
+                        )
+                else:
+                    ts_all = sensor_value_timeseries(
+                        df_region, picked_sensors, cfg.align_to, "humidity", catalog=catalog
+                    )
+                    if ts_all.empty:
+                        st.caption("No humidity data for the selected sensors.")
+                        return
+                    fig = plot_zone_single_plotly(
+                        ts_all,
+                        title=f"{cfg.exp_code} — {region_label} — selected sensors (RH)",
+                        y_title="Relative humidity (%)",
+                        stage_defs=stage_defs,
+                        plot_start=xa0,
+                        plot_end=xa1,
+                        y_range=y_r,
+                        show_markers=mk,
+                        line_width=lw_s,
+                        marker_size=ms_s,
+                        legend_in_plot=False,
+                    )
+                    apply_plotly_style(fig, {**_style_from_prefix(pfx), "show_legend": False})
+                    show_plotly_chart(
+                        fig, None, show_stage_legend=False,
+                        external_series_legend=True, series_legend_title="Sensors",
+                    )
+                    st.download_button(
+                        label=f"Download {region_label} sensor RH CSV",
+                        data=ts_all.to_csv().encode("utf-8"),
+                        file_name=f"{cfg.exp_code}_{region_label}_sensor_humidity.csv",
+                        mime="text/csv",
+                        key=f"{plot_prefix}__dl_rh_csv",
+                    )
+
+            st.radio(
+                "Chart layout",
+                options=["All selected sensors on one chart", "One chart per zone (wall)"],
+                horizontal=True,
+                key="rh_scmp_layout_mode",
+            )
+            cave_rh_cat = sensor_catalog(df_cave[df_cave["humidity"].notna()] if "humidity" in df_cave.columns else df_cave)
+            pk_rh_cat = sensor_catalog(df_pk[df_pk["humidity"].notna()] if "humidity" in df_pk.columns else df_pk)
+            _render_rh_sensor_block("CAVE", df_cave, cave_rh_cat, "rhscmp_cave", tuple(cfg.cave_walls_to_plot))
+            st.write("---")
+            _render_rh_sensor_block("PK", df_pk, pk_rh_cat, "rhscmp_pk", tuple(pk_zones_auto) if pk_zones_auto else ())
+
+with tab6:
     st.subheader("Vertical Profiles (Decay)")
     st.write(
         "Select a **stage** from the experiment log. That stage’s start–end time is divided into **5 equal sub-windows**; "
@@ -3645,12 +4355,36 @@ with tab5:
                     mime="text/csv",
                 )
 
-with tab6:
+with tab7:
     st.subheader("MFC (optional)")
-    st.write("If an MFC file is uploaded, this tab shows a quicklook of the flow and a simple summary. No infiltration analysis is performed in this version.")
+    st.write(
+        "If an MFC file is uploaded, this tab shows a quicklook of **flow rate** (left axis) and, when a "
+        "**temperature** column is present in the CSV, **temperature** (right axis) on the same chart."
+    )
 
     if fig_mfc is not None:
         st.write("**MFC quicklook**")
+        if mfc_has_temperature(mfc_df):
+            src = mfc_df.attrs.get("temp_source_col", "T")
+            n_t = int(mfc_df["T"].notna().sum())
+            st.caption(f"Temperature column **{src}** detected ({n_t:,} valid points) — dual y-axis plot enabled.")
+        else:
+            st.caption("No usable temperature column found. Flow only.")
+            with st.expander("Why is temperature missing?", expanded=True):
+                st.write("**MFC file columns:**", list(mfc_df.columns))
+                guess = _detect_mfc_temperature_column(mfc_df.columns)
+                if guess:
+                    preview = _parse_mfc_numeric_series(mfc_df[guess])
+                    st.warning(
+                        f"Column **{guess}** looks like temperature but has "
+                        f"**{int(preview.notna().sum())}** parseable numeric values. "
+                        "Check for non-numeric formatting in that column."
+                    )
+                else:
+                    st.info(
+                        "Expected a column named like **Temperature**, **Temp**, **Gas temperature**, etc. "
+                        "Rename the column or tell the team the exact header to add support."
+                    )
         if go is None:
             show_matplotlib_fig(fig_mfc)
         else:
@@ -3703,7 +4437,7 @@ with tab6:
         st.write("**MFC summary**")
         st.dataframe(build_summary_df(mfc_summary), use_container_width=True)
 
-with tab7:
+with tab8:
     st.subheader("Export")
 
     st.write("**Summary table**")
