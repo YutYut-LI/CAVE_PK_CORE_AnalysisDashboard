@@ -1780,6 +1780,21 @@ def render_x_controls(prefix: str, t0, t1, stage_defs) -> Tuple[Any, Any]:
     return t0p - pd.Timedelta(minutes=pre), t1p
 
 
+def series_mean_in_window(series: pd.Series, x0, x1) -> float:
+    """Mean of a time-indexed series within [x0, x1] (inclusive)."""
+    if series is None or len(series) == 0:
+        return float("nan")
+    s = series.dropna()
+    if len(s) == 0:
+        return float("nan")
+    if x0 is not None and x1 is not None:
+        x0p, x1p = pd.Timestamp(x0), pd.Timestamp(x1)
+        s = s[(s.index >= x0p) & (s.index <= x1p)]
+    if len(s) == 0:
+        return float("nan")
+    return float(s.mean())
+
+
 def render_font_legend_widgets(prefix: str, show_legend_toggle: bool = False) -> None:
     st.markdown("**Fonts**")
     c1, c2 = st.columns(2)
@@ -3660,26 +3675,15 @@ with tab5:
 
         with rh_overview_tab:
             st.markdown("### CAVE vs PK — regional humidity")
-            c1, c2, c3 = st.columns(3)
-            c1.metric(
-                "CAVE mean RH (avg)",
-                f"{rh_cave['mean'].mean(skipna=True):.1f} %"
-                if rh_cave is not None and rh_cave["mean"].notna().any()
-                else "NA",
-            )
-            c2.metric(
-                "PK mean RH (avg)",
-                f"{rh_pk['mean'].mean(skipna=True):.1f} %"
-                if rh_pk is not None and rh_pk["mean"].notna().any()
-                else "NA",
-            )
-            c3.metric("Min sensors (setting)", f"{cfg.min_sensors}")
 
-            if go is None or make_subplots is None:
-                st.warning("Plotly not installed; humidity overview requires Plotly.")
-            else:
-                rh_def = {**RH_PAGE_DEFAULTS, "use_fixed_y": True}
-                with st.expander("Plot options — Humidity overview", expanded=False):
+            rh_def = {**RH_PAGE_DEFAULTS, "use_fixed_y": True}
+            plot_opts_label = (
+                "Plot options — Humidity overview"
+                if go is not None and make_subplots is not None
+                else "Time window"
+            )
+            with st.expander(plot_opts_label, expanded=False):
+                if go is not None and make_subplots is not None:
                     _ensure_widget_defaults("rh_ov", rh_def)
                     render_save_reset_row("rh_ov", rh_def)
                     render_font_legend_widgets("rh_ov")
@@ -3692,10 +3696,54 @@ with tab5:
                                 st.number_input(f"{label} — min", key=f"rh_ov__y_{key}_min")
                             with c2:
                                 st.number_input(f"{label} — max", key=f"rh_ov__y_{key}_max")
-                    st.markdown("**X-axis (time)**")
-                    render_x_mode_widgets("rh_ov", t0, t1, stage_defs)
+                else:
+                    _ensure_widget_defaults("rh_ov", rh_def)
+                st.markdown("**X-axis (time)**")
+                render_x_mode_widgets("rh_ov", t0, t1, stage_defs)
 
-                x0, x1 = render_x_controls("rh_ov", t0, t1, stage_defs)
+            x0, x1 = render_x_controls("rh_ov", t0, t1, stage_defs)
+            cave_rh_period = series_mean_in_window(
+                rh_cave["mean"] if rh_cave is not None else pd.Series(dtype=float), x0, x1
+            )
+            pk_rh_period = series_mean_in_window(
+                rh_pk["mean"] if rh_pk is not None else pd.Series(dtype=float), x0, x1
+            )
+            cave_rh_std_period = series_mean_in_window(
+                rh_cave["std"] if rh_cave is not None else pd.Series(dtype=float), x0, x1
+            )
+            pk_rh_std_period = series_mean_in_window(
+                rh_pk["std"] if rh_pk is not None else pd.Series(dtype=float), x0, x1
+            )
+            if x0 is not None and x1 is not None:
+                st.caption(
+                    f"Period statistics for **{pd.Timestamp(x0):%Y-%m-%d %H:%M}** → "
+                    f"**{pd.Timestamp(x1):%Y-%m-%d %H:%M}** (same window as the chart). "
+                    f"Min sensors per bin: **{cfg.min_sensors}**."
+                )
+
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric(
+                "CAVE mean RH (period)",
+                f"{cave_rh_period:.1f} %" if np.isfinite(cave_rh_period) else "NA",
+            )
+            c2.metric(
+                "CAVE std RH (period)",
+                f"{cave_rh_std_period:.2f} %" if np.isfinite(cave_rh_std_period) else "NA",
+                help="Average of regional RH standard deviation within the selected time window.",
+            )
+            c3.metric(
+                "PK mean RH (period)",
+                f"{pk_rh_period:.1f} %" if np.isfinite(pk_rh_period) else "NA",
+            )
+            c4.metric(
+                "PK std RH (period)",
+                f"{pk_rh_std_period:.2f} %" if np.isfinite(pk_rh_std_period) else "NA",
+                help="Average of regional RH standard deviation within the selected time window.",
+            )
+
+            if go is None or make_subplots is None:
+                st.warning("Plotly not installed; humidity overview requires Plotly.")
+            else:
                 y_merged = _collect_ylims_from_prefix("rh_ov", RH_OVERVIEW_Y_KEYS, default_ylims())
                 use_fy = bool(st.session_state.get("rh_ov__use_fixed_y", True))
                 lw_rh, _ = _line_marker_from_prefix("rh_ov")
@@ -3713,12 +3761,14 @@ with tab5:
                 apply_plotly_style(fig_rh_ov, _style_from_prefix("rh_ov"))
                 show_plotly_chart(fig_rh_ov, stage_defs)
 
-            st.write("**Summary table**")
+            st.write("**Summary table (selected period)**")
             rh_summary = {
-                "rh_cave_mean_avg_pct": float(rh_cave["mean"].mean(skipna=True)),
-                "rh_pk_mean_avg_pct": float(rh_pk["mean"].mean(skipna=True)),
-                "rh_cave_std_avg": float(rh_cave["std"].mean(skipna=True)),
-                "rh_pk_std_avg": float(rh_pk["std"].mean(skipna=True)),
+                "window_start": pd.Timestamp(x0) if x0 is not None else None,
+                "window_end": pd.Timestamp(x1) if x1 is not None else None,
+                "rh_cave_mean_period_pct": cave_rh_period,
+                "rh_cave_std_period_pct": cave_rh_std_period,
+                "rh_pk_mean_period_pct": pk_rh_period,
+                "rh_pk_std_period_pct": pk_rh_std_period,
             }
             st.dataframe(build_summary_df(rh_summary), use_container_width=True)
 
