@@ -399,10 +399,15 @@ def load_mfc_csv(file_bytes: bytes, filename: str) -> pd.DataFrame:
     if missing:
         raise ValueError(f"MFC missing {missing}. Columns: {list(dfm.columns)}")
 
+    # Detect the temperature column from the *raw* CSV columns only, before adding
+    # our own derived "t"/"Fset"/"Fmeas" columns below — otherwise the fallback
+    # matcher can mistake our derived "t" (time) column for a temperature column
+    # on older MFC files that don't record temperature at all.
+    temp_col = _detect_mfc_temperature_column(dfm.columns)
+
     dfm["t"] = pd.to_datetime(dfm[ts_col], errors="coerce", dayfirst=True)
     dfm["Fset"] = _parse_mfc_numeric_series(dfm[fset_col])
     dfm["Fmeas"] = _parse_mfc_numeric_series(dfm[fmeas_col])
-    temp_col = _detect_mfc_temperature_column(dfm.columns)
     if temp_col is not None:
         dfm["T"] = _parse_mfc_numeric_series(dfm[temp_col])
     dfm = (
