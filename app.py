@@ -111,6 +111,34 @@ class AppConfig:
     baseline_fallback_minutes: int = 10
     flow_on_th: float = 0.2
 
+    # ---- Air exchange (PK <-> CAVE) -------------------------------------
+    # Zone volumes (m3). "Effective" CAVE volume excludes the space occupied
+    # by PK, so it is the air volume actually taking part in the exchange.
+    v_pk: float = 455.67
+    v_cave_gross: float = 1917.49
+    v_cave_effective: float = 1461.82
+    use_effective_cave_volume: bool = True
+
+    # Per-sensor baseline (increment) settings
+    baseline_min_samples: int = 5   # sensors with fewer baseline points are dropped
+    noise_sigma_k: float = 5.0      # excess threshold safeguard = k * sigma(baseline)
+
+    # CAVE-side sensors mounted on the PK exterior wall. They belong to CAVE but
+    # read the concentration at the envelope, not the room bulk, so they are kept
+    # out of the CAVE bulk mean and offered separately as a driving concentration.
+    envelope_walls: Tuple[str, ...] = ("FFE", "GFE")
+    exclude_envelope_from_bulk: bool = True
+
+    # Exchange-rate window / fit settings
+    dc_min_ppm: float = 100.0       # continuous |dC| criterion from window start
+    lam_win_min: int = 15           # sliding-window length (minutes)
+    lam_step_min: int = 5           # sliding-window step (minutes)
+    lam_min_pts_win: int = 10
+    lam_min_pts_full: int = 20
+    lam_min_pts_int: int = 10
+    force_zero_intercept: bool = True
+    lambda_ext: float = 0.0         # CAVE<->outdoor ACH, used only when CAVE receives
+
     ylims: Dict[str, Tuple[float, float]] = None
 
 
@@ -136,6 +164,7 @@ def default_ylims():
         "io_ex": (0.0, 1.00),
         "scatter_cave_ex": (0, 600),
         "scatter_pk_ex": (0, 300),
+        "lam_window": (0.0, 0.80),
     }
 
 
@@ -589,6 +618,377 @@ def compute_humidity_metrics(df_region: pd.DataFrame, align_to: str, min_sensors
     cv = cv.where(ok)
     mi = mi.where(ok)
     return {"n": n, "mean": mean, "std": std, "cv": cv, "mi": mi}
+
+
+# =========================================================
+# Air exchange (PK <-> CAVE): per-sensor baselines / increments
+# =========================================================
+# Every Explora sensor carries its own zero-point calibration offset. Measured
+# over a baseline stage, a single sensor is stable to ~0.5 ppm while different
+# sensors disagree by 40-70 ppm, so the between-sensor spread is calibration,
+# not mixing. Subtracting a per-sensor baseline ("increment") removes that
+# offset and, unlike a region-level baseline, stays correct when the set of
+# reporting sensors changes over time.
+def per_sensor_baselines(df_region: pd.DataFrame, t0, t1, min_samples: int):
+    """Mean CO2 per sensor over [t0, t1]; sensors with too few points are dropped."""
+    empty = (pd.Series(dtype=float), pd.DataFrame(columns=["sensor_number", "wall", "baseline", "n", "kept"]))
+    if df_region is None or df_region.empty or t0 is None or t1 is None:
+        return empty
+
+    d = df_region.dropna(subset=["time", "co2"]).copy()
+    d = d[(d["time"] >= pd.Timestamp(t0)) & (d["time"] <= pd.Timestamp(t1))]
+    if d.empty:
+        return empty
+
+    g = d.groupby("sensor_number")
+    info = pd.DataFrame({
+        "baseline": g["co2"].mean(),
+        "n": g["co2"].size(),
+        "wall": g["wall"].first().astype(str),
+    }).reset_index()
+    info["kept"] = info["n"] >= int(min_samples)
+
+    kept = info[info["kept"]]
+    baselines = pd.Series(kept["baseline"].values, index=kept["sensor_number"].values, dtype=float)
+
+    ref = float(kept["baseline"].mean()) if len(kept) else np.nan
+    info["offset"] = info["baseline"] - ref
+    return baselines, info.sort_values("sensor_number").reset_index(drop=True)
+
+
+def add_increment_column(df: pd.DataFrame, baselines: pd.Series) -> pd.DataFrame:
+    """Attach co2_inc = co2 - per-sensor baseline. Sensors without a baseline are dropped."""
+    out = df.copy()
+    b = out["sensor_number"].map(baselines)
+    out = out[b.notna()].copy()
+    out["co2_inc"] = out["co2"] - b[b.notna()]
+    return out
+
+
+def excess_mean_series(df_region: pd.DataFrame, align_to: str, min_sensors: int, value_col: str = "co2_inc"):
+    """Region-mean excess (increment) time series, gated on sensor count per bin."""
+    if df_region is None or df_region.empty or value_col not in df_region.columns:
+        return pd.Series(dtype=float)
+    d = df_region.dropna(subset=["time", value_col]).copy()
+    if d.empty:
+        return pd.Series(dtype=float)
+    d["tbin"] = d["time"].dt.floor(align_to)
+    g = d.groupby("tbin")
+    n = g["sensor_number"].nunique()
+    return g[value_col].mean().where(n >= min_sensors)
+
+
+def excess_noise_stats(df_region: pd.DataFrame, ex_series: pd.Series, t0, t1, align_to: str) -> Dict[str, float]:
+    """Noise floor of the debiased data over the baseline window.
+
+    sigma_sensor : between-sensor spread of increments (calibration removed)
+    sigma_mean   : noise of the region MEAN, i.e. sigma_sensor / sqrt(n)
+    sd_series    : temporal sd of the region-mean excess (used for the threshold)
+    """
+    out = {"sigma_sensor": np.nan, "sigma_mean": np.nan, "sd_series": np.nan, "n_sensors": 0}
+    if df_region is None or df_region.empty or t0 is None or t1 is None:
+        return out
+
+    d = df_region.dropna(subset=["time", "co2_inc"]).copy()
+    d = d[(d["time"] >= pd.Timestamp(t0)) & (d["time"] <= pd.Timestamp(t1))]
+    if not d.empty:
+        d["tbin"] = d["time"].dt.floor(align_to)
+        out["sigma_sensor"] = float(d.groupby("tbin")["co2_inc"].std().mean())
+        out["n_sensors"] = int(d["sensor_number"].nunique())
+        if out["n_sensors"] > 0 and np.isfinite(out["sigma_sensor"]):
+            out["sigma_mean"] = out["sigma_sensor"] / np.sqrt(out["n_sensors"])
+
+    s = ex_series.dropna() if ex_series is not None else pd.Series(dtype=float)
+    s = s[(s.index >= pd.Timestamp(t0)) & (s.index <= pd.Timestamp(t1))]
+    if len(s) > 1:
+        out["sd_series"] = float(s.std(ddof=1))
+    return out
+
+
+# =========================================================
+# Air exchange: direction, window selection, estimators
+# =========================================================
+DIR_CAVE_TO_PK = "CAVE → PK"
+DIR_PK_TO_CAVE = "PK → CAVE"
+
+
+def detect_exchange_direction(ex_cave: pd.Series, ex_pk: pd.Series, t0, t1) -> Tuple[str, float, float]:
+    """Source zone = whichever region carries the larger excess over [t0, t1]."""
+    c = mean_in_window(ex_cave, t0, t1) if (ex_cave is not None and len(ex_cave)) else np.nan
+    p = mean_in_window(ex_pk, t0, t1) if (ex_pk is not None and len(ex_pk)) else np.nan
+    if np.isfinite(c) and np.isfinite(p) and p > c:
+        return DIR_PK_TO_CAVE, c, p
+    return DIR_CAVE_TO_PK, c, p
+
+
+def select_exchange_window(ex_other: pd.Series, ex_solve: pd.Series, t_start, t_end, dc_min: float):
+    """Longest unbroken stretch in [t_start, t_end] with |dC| >= dc_min and a constant sign.
+
+    dC = other zone - solved zone. Its sign depends on which way the gradient runs:
+    positive while the solved zone is filling, negative while it is emptying. Both
+    are valid — the through-origin regression flips X and Y together — so the
+    magnitude sets the signal-to-noise floor and the sign must merely stay constant.
+    A sign change mid-window means the gradient reversed and the single well-mixed
+    two-zone model no longer describes that stretch, so runs are cut there.
+
+    Points are never filtered individually; the fit always runs on one continuous
+    segment. Taking the longest run covers both window shapes: a decay stage where
+    |dC| starts large and shrinks, and a rising release stage where it must first
+    climb past the threshold.
+    """
+    fail = (pd.DatetimeIndex([]), pd.Series(dtype=float), "no overlapping data for the two zones")
+    if ex_other is None or ex_solve is None or len(ex_other) == 0 or len(ex_solve) == 0:
+        return fail
+
+    idx = ex_other.dropna().index.intersection(ex_solve.dropna().index)
+    if t_start is not None:
+        idx = idx[idx >= pd.Timestamp(t_start)]
+    if t_end is not None:
+        idx = idx[idx <= pd.Timestamp(t_end)]
+    if len(idx) == 0:
+        return fail
+
+    dC = (ex_other.reindex(idx) - ex_solve.reindex(idx)).astype(float)
+    vals = dC.to_numpy(dtype=float)
+    ok = np.isfinite(vals) & (np.abs(vals) >= float(dc_min))
+
+    if not ok.any():
+        peak = np.nanmax(np.abs(vals)) if np.isfinite(vals).any() else np.nan
+        return (pd.DatetimeIndex([]), dC,
+                f"|ΔC| never reaches {dc_min:.0f} ppm in this stage (peak {peak:.0f} ppm)")
+
+    # Maximal runs that stay above the threshold AND keep one sign.
+    sgn = np.sign(vals)
+    runs, start = [], None
+    for i, flag in enumerate(ok):
+        if not flag:
+            if start is not None:
+                runs.append((start, i)); start = None
+        elif start is None:
+            start = i
+        elif sgn[i] != sgn[start]:
+            runs.append((start, i)); start = i
+    if start is not None:
+        runs.append((start, len(ok)))
+
+    a, b = max(runs, key=lambda r: r[1] - r[0])
+    keep = idx[a:b]
+    direction_word = "into" if sgn[a] > 0 else "out of"
+
+    bits = [f"ΔC {'positive' if sgn[a] > 0 else 'negative'} (tracer moving {direction_word} the solved zone)"]
+    if a > 0:
+        bits.append(f"started at {idx[a]:%H:%M:%S}")
+    if b < len(ok):
+        bits.append(f"ended at {idx[b]:%H:%M:%S} when |ΔC| dropped below {dc_min:.0f} ppm or the gradient reversed")
+    if a == 0 and b == len(ok):
+        bits.append(f"|ΔC| stayed above {dc_min:.0f} ppm for the whole stage")
+    if len(runs) > 1:
+        bits.append(f"longest of {len(runs)} qualifying segments")
+
+    return keep, dC.loc[keep], "; ".join(bits)
+
+
+def _cumtrapz_seconds(values: np.ndarray, t_sec: np.ndarray) -> np.ndarray:
+    """Cumulative trapezoidal integral, first element 0."""
+    out = np.zeros_like(values, dtype=float)
+    if len(values) < 2:
+        return out
+    out[1:] = np.cumsum(0.5 * (values[1:] + values[:-1]) * np.diff(t_sec))
+    return out
+
+
+def lambda_from_XY(X, Y) -> Tuple[float, float, int]:
+    """Through-origin least squares  lambda = sum(X*Y) / sum(X^2)  [units of Y/X]."""
+    X = np.asarray(X, dtype=float)
+    Y = np.asarray(Y, dtype=float)
+    ok = np.isfinite(X) & np.isfinite(Y)
+    X, Y = X[ok], Y[ok]
+    if len(X) < 3:
+        return np.nan, np.nan, len(X)
+    denom = float(np.dot(X, X))
+    if denom <= 0:
+        return np.nan, np.nan, len(X)
+    lam = float(np.dot(X, Y) / denom)
+    ss_res = float(np.sum((Y - lam * X) ** 2))
+    ss_tot = float(np.sum((Y - np.mean(Y)) ** 2))
+    r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else np.nan
+    return lam, r2, len(X)
+
+
+def lambda_integrated(rcv: pd.Series, dC: pd.Series, force_zero_intercept: bool, lambda_ext_per_s: float = 0.0):
+    """Integrated method:  y = C_rcv(t) - C_rcv(t0) [+ lam_ext * int C_rcv]  vs  x = int dC dt."""
+    out = {"lam_h": np.nan, "r2": np.nan, "n": 0, "x": np.array([]), "y": np.array([]), "intercept": 0.0}
+    r = rcv.dropna()
+    idx = r.index.intersection(dC.dropna().index)
+    if len(idx) < 2:
+        return out
+
+    r = r.reindex(idx).astype(float)
+    d = dC.reindex(idx).astype(float)
+    t_sec = (idx - idx[0]).total_seconds().to_numpy(dtype=float)
+
+    y = (r - float(r.iloc[0])).to_numpy(dtype=float)
+    if lambda_ext_per_s:
+        # Receiver also loses to outdoors: move that known sink to the left-hand side.
+        y = y + lambda_ext_per_s * _cumtrapz_seconds(r.to_numpy(dtype=float), t_sec)
+    x = _cumtrapz_seconds(d.to_numpy(dtype=float), t_sec)
+
+    ok = np.isfinite(x) & np.isfinite(y)
+    x, y = x[ok], y[ok]
+    if len(x) < 2:
+        return out
+
+    if force_zero_intercept:
+        lam, r2, n = lambda_from_XY(x, y)
+        b = 0.0
+    else:
+        lam, b = np.polyfit(x, y, 1)
+        y_hat = lam * x + b
+        ss_res = float(np.sum((y - y_hat) ** 2))
+        ss_tot = float(np.sum((y - np.mean(y)) ** 2))
+        r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else np.nan
+        n = len(x)
+
+    out.update({"lam_h": lam * 3600.0, "r2": r2, "n": n, "x": x, "y": y, "intercept": float(b)})
+    return out
+
+
+def lambda_differential(rcv: pd.Series, dC: pd.Series, dc_min: float, lambda_ext_per_s: float = 0.0):
+    """Discrete forward-difference form:  Y = dC_rcv/dt [+ lam_ext * C_rcv],  X = dC."""
+    out = {"X": np.array([]), "Y": np.array([]), "t_mid": pd.DatetimeIndex([]),
+           "lam_h": np.nan, "r2": np.nan, "n": 0}
+    r = rcv.dropna()
+    idx = r.index.intersection(dC.dropna().index)
+    if len(idx) < 3:
+        return out
+
+    r = r.reindex(idx).astype(float)
+    d = dC.reindex(idx).astype(float)
+    t_sec = (idx - idx[0]).total_seconds().to_numpy(dtype=float)
+
+    dt = np.diff(t_sec)
+    dr = np.diff(r.to_numpy(dtype=float))
+    Y = np.full_like(dt, np.nan, dtype=float)
+    ok_dt = dt > 0
+    Y[ok_dt] = dr[ok_dt] / dt[ok_dt]
+    if lambda_ext_per_s:
+        Y = Y + lambda_ext_per_s * r.to_numpy(dtype=float)[:-1]
+
+    X = d.to_numpy(dtype=float)[:-1]
+    t_mid = idx[:-1]
+
+    # Magnitude, not sign: dC is negative whenever the solved zone is emptying.
+    ok = np.isfinite(X) & np.isfinite(Y) & (np.abs(X) >= float(dc_min))
+    X, Y, t_mid = X[ok], Y[ok], t_mid[ok]
+
+    lam, r2, n = lambda_from_XY(X, Y)
+    out.update({"X": X, "Y": Y, "t_mid": t_mid, "lam_h": lam * 3600.0, "r2": r2, "n": n})
+    return out
+
+
+def lambda_sliding(X, Y, t_mid, win_min: int, step_min: int, min_pts: int):
+    """Sliding-window through-origin fits; returns window-centre times and lambda in 1/h."""
+    out = {"times": pd.DatetimeIndex([]), "lam_h": np.array([]), "r2": np.array([]),
+           "mean_h": np.nan, "median_h": np.nan}
+    t_mid = pd.DatetimeIndex(t_mid)
+    if len(t_mid) < min_pts:
+        return out
+
+    win = pd.Timedelta(minutes=int(win_min))
+    step = pd.Timedelta(minutes=int(step_min))
+    t_cur, t_end = t_mid.min(), t_mid.max()
+
+    times, lams, r2s = [], [], []
+    while t_cur + win <= t_end:
+        m = (t_mid >= t_cur) & (t_mid < t_cur + win)
+        if int(np.sum(m)) >= int(min_pts):
+            lam, r2, _ = lambda_from_XY(np.asarray(X)[m], np.asarray(Y)[m])
+            if np.isfinite(lam):
+                times.append(t_cur + win / 2)
+                lams.append(lam * 3600.0)
+                r2s.append(r2)
+        t_cur = t_cur + step
+
+    if not times:
+        return out
+    lam_arr = np.asarray(lams, dtype=float)
+    out.update({
+        "times": pd.to_datetime(times),
+        "lam_h": lam_arr,
+        "r2": np.asarray(r2s, dtype=float),
+        "mean_h": float(np.nanmean(lam_arr)),
+        "median_h": float(np.nanmedian(lam_arr)),
+    })
+    return out
+
+
+# =========================================================
+# Air exchange: transfer (I/O) ratio and excess scatter
+# =========================================================
+def compute_transfer_ratio(src_ex: pd.Series, rcv_ex: pd.Series, thresh: float, t_rel0, t_rel1):
+    """receiver/source excess ratio, gated on the DENOMINATOR only.
+
+    The numerator is never clipped: a negative receiver excess early in the
+    release is real (the receiver has not responded yet) and clipping it would
+    bias the release-window mean upward.
+    """
+    out = {"io_ex": pd.Series(dtype=float), "factor": np.nan, "sd": np.nan, "n": 0, "n_gated": 0}
+    if src_ex is None or rcv_ex is None or len(src_ex) == 0 or len(rcv_ex) == 0:
+        return out
+
+    idx = src_ex.dropna().index.intersection(rcv_ex.dropna().index)
+    if len(idx) == 0:
+        return out
+
+    s = src_ex.reindex(idx).astype(float)
+    r = rcv_ex.reindex(idx).astype(float)
+    gate = s > float(thresh)
+    io_ex = (r / s).where(gate)
+
+    rel = io_ex
+    if t_rel0 is not None and t_rel1 is not None:
+        rel = io_ex[(io_ex.index >= pd.Timestamp(t_rel0)) & (io_ex.index <= pd.Timestamp(t_rel1))]
+        n_gated = int((~gate[(gate.index >= pd.Timestamp(t_rel0)) & (gate.index <= pd.Timestamp(t_rel1))]).sum())
+    else:
+        n_gated = int((~gate).sum())
+    rel = rel.dropna()
+
+    out.update({
+        "io_ex": io_ex,
+        "factor": float(rel.mean()) if len(rel) else np.nan,
+        "sd": float(rel.std(ddof=1)) if len(rel) > 1 else np.nan,
+        "n": int(len(rel)),
+        "n_gated": n_gated,
+    })
+    return out
+
+
+def fit_excess_scatter(src_ex: pd.Series, rcv_ex: pd.Series, thresh: float, t_rel0, t_rel1):
+    """OLS of receiver excess on source excess over the release window."""
+    empty = pd.DataFrame(columns=["cave_ex", "pk_ex"])
+    if src_ex is None or rcv_ex is None or len(src_ex) == 0 or len(rcv_ex) == 0:
+        return empty, np.nan, np.nan, np.nan
+
+    idx = src_ex.dropna().index.intersection(rcv_ex.dropna().index)
+    if t_rel0 is not None and t_rel1 is not None:
+        idx = idx[(idx >= pd.Timestamp(t_rel0)) & (idx <= pd.Timestamp(t_rel1))]
+    if len(idx) == 0:
+        return empty, np.nan, np.nan, np.nan
+
+    # Column names kept as cave_ex/pk_ex so the existing scatter plotters work unchanged.
+    df_sc = pd.DataFrame({"cave_ex": src_ex.reindex(idx), "pk_ex": rcv_ex.reindex(idx)}).dropna()
+    df_sc = df_sc[df_sc["cave_ex"] > float(thresh)]
+    if len(df_sc) < 2:
+        return df_sc, np.nan, np.nan, np.nan
+
+    x = df_sc["cave_ex"].to_numpy(dtype=float)
+    y = df_sc["pk_ex"].to_numpy(dtype=float)
+    slope, intercept = np.polyfit(x, y, 1)
+    y_hat = slope * x + intercept
+    ss_res = float(np.sum((y - y_hat) ** 2))
+    ss_tot = float(np.sum((y - np.mean(y)) ** 2))
+    r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else np.nan
+    return df_sc, float(slope), float(intercept), float(r2)
 
 
 def zone_mean_timeseries(df_region: pd.DataFrame, zone_col: str, zones, value_col: str, align_to: str, min_sensors: int):
@@ -1353,19 +1753,21 @@ def plot_mfc(mfc_df, t_on, t_off, t_rel0, t_rel1, cfg: AppConfig, *, line_width:
     return fig
 
 
-def plot_io_ratio(io_ex, infiltration_factor, t_rel0, t_rel1, t_base0, t_base1, ex_thresh, cfg: AppConfig):
+def plot_io_ratio(io_ex, infiltration_factor, t_rel0, t_rel1, t_base0, t_base1, ex_thresh, cfg: AppConfig,
+                  *, src_label: str = "CAVE", rcv_label: str = "PK"):
     fig, ax = plt.subplots(figsize=(14, 5))
-    ax.plot(io_ex.index, io_ex.values, linewidth=2.0, label="I/O_ex(t) = PK_ex / CAVE_ex (thresholded)")
+    ax.plot(io_ex.index, io_ex.values, linewidth=2.0,
+            label=f"ratio(t) = {rcv_label}_ex / {src_label}_ex (thresholded)")
     ax.axvspan(t_rel0, t_rel1, alpha=0.15, label="Release window (Stage2)")
 
     if np.isfinite(infiltration_factor):
-        ax.axhline(infiltration_factor, linestyle="--", linewidth=2.0, label=f"mean(I/O_ex) in Release = {infiltration_factor:.3f}")
+        ax.axhline(infiltration_factor, linestyle="--", linewidth=2.0, label=f"mean in Release = {infiltration_factor:.3f}")
 
     ax.axvspan(t_base0, t_base1, alpha=0.08, label="Baseline window")
-    ax.text(0.01, 0.02, f"Threshold: CAVE_ex > {ex_thresh:.1f} ppm", transform=ax.transAxes, fontsize=9, va="bottom", ha="left")
+    ax.text(0.01, 0.02, f"Threshold: {src_label}_ex > {ex_thresh:.1f} ppm", transform=ax.transAxes, fontsize=9, va="bottom", ha="left")
 
-    ax.set_title(f"{cfg.exp_code} — Excess I/O ratio", fontsize=12, fontweight="bold")
-    ax.set_ylabel("I/O_ex (-)", fontsize=12, fontweight="bold")
+    ax.set_title(f"{cfg.exp_code} — Excess transfer ratio ({src_label} → {rcv_label})", fontsize=12, fontweight="bold")
+    ax.set_ylabel("Transfer ratio (-)", fontsize=12, fontweight="bold")
     ax.set_xlabel("Time", fontsize=12, fontweight="bold")
     ax.grid(True)
     ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
@@ -1380,7 +1782,8 @@ def plot_io_ratio(io_ex, infiltration_factor, t_rel0, t_rel1, t_base0, t_base1, 
     return fig
 
 
-def plot_scatter(df_sc, slope, intercept, r2, cfg: AppConfig):
+def plot_scatter(df_sc, slope, intercept, r2, cfg: AppConfig,
+                 *, src_label: str = "CAVE", rcv_label: str = "PK"):
     fig, ax = plt.subplots(figsize=(6.5, 5.5))
     ax.scatter(df_sc["cave_ex"].values, df_sc["pk_ex"].values, s=25, alpha=0.8, label="Release points (thresholded)")
 
@@ -1389,9 +1792,9 @@ def plot_scatter(df_sc, slope, intercept, r2, cfg: AppConfig):
         yline = intercept + slope * xline
         ax.plot(xline, yline, linewidth=2.0, linestyle="--", label=f"Fit: slope={slope:.3f}, R²={r2:.3f}")
 
-    ax.set_title(f"{cfg.exp_code} — PK_ex vs CAVE_ex (Release only)", fontsize=12, fontweight="bold")
-    ax.set_xlabel("CAVE_ex (ppm)", fontsize=12, fontweight="bold")
-    ax.set_ylabel("PK_ex (ppm)", fontsize=12, fontweight="bold")
+    ax.set_title(f"{cfg.exp_code} — {rcv_label}_ex vs {src_label}_ex (Release only)", fontsize=12, fontweight="bold")
+    ax.set_xlabel(f"{src_label}_ex (ppm)", fontsize=12, fontweight="bold")
+    ax.set_ylabel(f"{rcv_label}_ex (ppm)", fontsize=12, fontweight="bold")
     ax.grid(True)
     ax.legend(frameon=True, fontsize=9, loc="upper left")
 
@@ -2114,7 +2517,10 @@ def plot_zone_single_plotly(
     return fig
 
 
-def plot_io_ratio_plotly(io_ex, infiltration_factor, t_rel0, t_rel1, t_base0, t_base1, ex_thresh, cfg: AppConfig):
+def plot_io_ratio_plotly(io_ex, infiltration_factor, t_rel0, t_rel1, t_base0, t_base1, ex_thresh, cfg: AppConfig,
+                         *, src_label: str = "CAVE", rcv_label: str = "PK",
+                         x_range: Optional[Tuple[Any, Any]] = None,
+                         y_range: Optional[Tuple[float, float]] = None):
     _require_plotly()
     fig = go.Figure()
 
@@ -2124,10 +2530,10 @@ def plot_io_ratio_plotly(io_ex, infiltration_factor, t_rel0, t_rel1, t_base0, t_
             x=s.index,
             y=s.values,
             mode="lines+markers",
-            name="I/O_ex(t) = PK_ex / CAVE_ex (thresholded)",
+            name=f"ratio(t) = {rcv_label}_ex / {src_label}_ex (thresholded)",
             line=dict(width=2),
             marker=dict(size=5, opacity=0.6),
-            hovertemplate="t=%{x|%Y-%m-%d %H:%M:%S}<br>I/O_ex=%{y:.4f}<extra></extra>",
+            hovertemplate="t=%{x|%Y-%m-%d %H:%M:%S}<br>ratio=%{y:.4f}<extra></extra>",
         )
     )
 
@@ -2142,9 +2548,9 @@ def plot_io_ratio_plotly(io_ex, infiltration_factor, t_rel0, t_rel1, t_base0, t_
         fig.add_hline(y=infiltration_factor, line_dash="dash", line_width=2, annotation_text=f"mean={infiltration_factor:.3f}", annotation_position="top right")
 
     fig.update_layout(
-        title=f"{cfg.exp_code} — Excess I/O ratio",
+        title=f"{cfg.exp_code} — Excess transfer ratio ({src_label} → {rcv_label})",
         xaxis_title="Time",
-        yaxis_title="I/O_ex (-)",
+        yaxis_title="Transfer ratio (-)",
         template="plotly_white",
         height=420,
         margin=dict(l=40, r=20, t=60, b=40),
@@ -2152,10 +2558,14 @@ def plot_io_ratio_plotly(io_ex, infiltration_factor, t_rel0, t_rel1, t_base0, t_
         clickmode="event+select",
     )
 
-    if (t_rel0 is not None) and (t_rel1 is not None):
+    if x_range is not None:
+        fig.update_xaxes(range=[x_range[0], x_range[1]])
+    elif (t_rel0 is not None) and (t_rel1 is not None):
         fig.update_xaxes(range=[t_rel0, t_rel1])
 
-    if cfg.use_fixed_ylims:
+    if y_range is not None:
+        fig.update_yaxes(range=list(y_range))
+    elif cfg.use_fixed_ylims:
         fig.update_yaxes(range=list(cfg.ylims["io_ex"]))
 
     # Threshold note (as annotation)
@@ -2165,7 +2575,7 @@ def plot_io_ratio_plotly(io_ex, infiltration_factor, t_rel0, t_rel1, t_base0, t_
         x=0.01,
         y=0.02,
         showarrow=False,
-        text=f"Threshold: CAVE_ex > {ex_thresh:.1f} ppm",
+        text=f"Threshold: {src_label}_ex > {ex_thresh:.1f} ppm",
         font=dict(size=11),
         align="left",
     )
@@ -2173,7 +2583,9 @@ def plot_io_ratio_plotly(io_ex, infiltration_factor, t_rel0, t_rel1, t_base0, t_
     return fig
 
 
-def plot_scatter_plotly(df_sc, slope, intercept, r2, cfg: AppConfig):
+def plot_scatter_plotly(df_sc, slope, intercept, r2, cfg: AppConfig,
+                        *, src_label: str = "CAVE", rcv_label: str = "PK",
+                        auto_range: bool = False):
     _require_plotly()
     fig = go.Figure()
 
@@ -2184,7 +2596,7 @@ def plot_scatter_plotly(df_sc, slope, intercept, r2, cfg: AppConfig):
             mode="markers",
             name="Release points (thresholded)",
             marker=dict(size=7, opacity=0.8),
-            hovertemplate="CAVE_ex=%{x:.2f} ppm<br>PK_ex=%{y:.2f} ppm<extra></extra>",
+            hovertemplate=f"{src_label}_ex=%{{x:.2f}} ppm<br>{rcv_label}_ex=%{{y:.2f}} ppm<extra></extra>",
         )
     )
 
@@ -2205,19 +2617,161 @@ def plot_scatter_plotly(df_sc, slope, intercept, r2, cfg: AppConfig):
         )
 
     fig.update_layout(
-        title=f"{cfg.exp_code} — PK_ex vs CAVE_ex (Release only)",
-        xaxis_title="CAVE_ex (ppm)",
-        yaxis_title="PK_ex (ppm)",
+        title=f"{cfg.exp_code} — {rcv_label}_ex vs {src_label}_ex (Release only)",
+        xaxis_title=f"{src_label}_ex (ppm)",
+        yaxis_title=f"{rcv_label}_ex (ppm)",
         template="plotly_white",
         height=520,
         margin=dict(l=40, r=20, t=60, b=40),
         clickmode="event+select",
     )
 
-    if cfg.use_fixed_ylims:
+    if cfg.use_fixed_ylims and not auto_range:
         fig.update_xaxes(range=list(cfg.ylims["scatter_cave_ex"]))
         fig.update_yaxes(range=list(cfg.ylims["scatter_pk_ex"]))
 
+    return fig
+
+
+# ---- Air-exchange rate (lambda) figures ------------------------------------
+def _lam_titles(cfg: AppConfig, src_label: str, rcv_label: str) -> Tuple[str, str, str]:
+    return (
+        f"{cfg.exp_code} — λ integrated ({src_label} → {rcv_label})",
+        f"{cfg.exp_code} — λ full regression ({src_label} → {rcv_label})",
+        f"{cfg.exp_code} — λ sliding window ({src_label} → {rcv_label})",
+    )
+
+
+def plot_lambda_integrated_plotly(res, cfg: AppConfig, src_label: str, rcv_label: str):
+    _require_plotly()
+    t_int, _, _ = _lam_titles(cfg, src_label, rcv_label)
+    fig = go.Figure()
+    x, y = res["x"], res["y"]
+    fig.add_trace(go.Scatter(
+        x=x, y=y, mode="markers", name="Data",
+        marker=dict(size=6, opacity=0.8),
+        hovertemplate="x=%{x:.4g} ppm·s<br>y=%{y:.2f} ppm<extra></extra>",
+    ))
+    if np.isfinite(res["lam_h"]) and len(x):
+        xs = np.array([float(np.min(x)), float(np.max(x))])
+        ys = (res["lam_h"] / 3600.0) * xs + res.get("intercept", 0.0)
+        fig.add_trace(go.Scatter(
+            x=xs, y=ys, mode="lines", hoverinfo="skip",
+            name=f"Fit λ={res['lam_h']:.3f} 1/h, R²={res['r2']:.3f}",
+            line=dict(width=2, dash="dash"),
+        ))
+    fig.update_layout(
+        title=t_int,
+        xaxis_title=f"x = ∫({src_label}_ex − {rcv_label}_ex) dt  [ppm·s]",
+        yaxis_title=f"y = {rcv_label}_ex(t) − {rcv_label}_ex(t₀)  [ppm]",
+        template="plotly_white", height=480,
+        margin=dict(l=50, r=20, t=60, b=45),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+    )
+    return fig
+
+
+def plot_lambda_full_plotly(res, cfg: AppConfig, src_label: str, rcv_label: str):
+    _require_plotly()
+    _, t_full, _ = _lam_titles(cfg, src_label, rcv_label)
+    fig = go.Figure()
+    X, Y = res["X"], res["Y"]
+    fig.add_trace(go.Scatter(
+        x=X, y=Y, mode="markers", name="Data",
+        marker=dict(size=6, opacity=0.7),
+        hovertemplate="ΔC=%{x:.1f} ppm<br>dC/dt=%{y:.5f} ppm/s<extra></extra>",
+    ))
+    if np.isfinite(res["lam_h"]) and len(X):
+        xs = np.array([float(np.min(X)), float(np.max(X))])
+        fig.add_trace(go.Scatter(
+            x=xs, y=(res["lam_h"] / 3600.0) * xs, mode="lines", hoverinfo="skip",
+            name=f"Fit λ={res['lam_h']:.3f} 1/h, R²={res['r2']:.3f}",
+            line=dict(width=2),
+        ))
+    fig.update_layout(
+        title=t_full,
+        xaxis_title=f"X = {src_label}_ex − {rcv_label}_ex  [ppm]",
+        yaxis_title=f"Y = d{rcv_label}_ex/dt  [ppm/s]",
+        template="plotly_white", height=480,
+        margin=dict(l=55, r=20, t=60, b=45),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+    )
+    return fig
+
+
+def plot_lambda_window_plotly(res, cfg: AppConfig, src_label: str, rcv_label: str,
+                              win_min: int, step_min: int,
+                              y_range: Optional[Tuple[float, float]] = None):
+    _require_plotly()
+    _, _, t_win = _lam_titles(cfg, src_label, rcv_label)
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=res["times"], y=res["lam_h"], mode="lines+markers", name="λ_window(t)",
+        line=dict(width=2.5), marker=dict(size=6),
+        hovertemplate="t=%{x|%H:%M}<br>λ=%{y:.4f} 1/h<extra></extra>",
+    ))
+    if np.isfinite(res["mean_h"]):
+        fig.add_hline(y=res["mean_h"], line_dash="dash", line_width=2,
+                      annotation_text=f"mean={res['mean_h']:.3f}", annotation_position="top right")
+    if np.isfinite(res["median_h"]):
+        fig.add_hline(y=res["median_h"], line_dash="dot", line_width=2,
+                      annotation_text=f"median={res['median_h']:.3f}", annotation_position="bottom right")
+    fig.update_layout(
+        title=f"{t_win} | win={win_min} min, step={step_min} min",
+        xaxis_title="Time", yaxis_title="λ_window (1/h)",
+        template="plotly_white", height=420,
+        margin=dict(l=45, r=20, t=60, b=45),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+    )
+    if y_range is not None:
+        fig.update_yaxes(range=list(y_range))
+    return fig
+
+
+def plot_lambda_panel_matplotlib(res_int, res_full, res_win, cfg: AppConfig,
+                                 src_label: str, rcv_label: str, win_min: int, step_min: int):
+    """Three-panel static version of the lambda figures (used for PNG export)."""
+    t_int, t_full, t_win = _lam_titles(cfg, src_label, rcv_label)
+    fig, axes = plt.subplots(1, 3, figsize=(19, 5.2))
+
+    ax = axes[0]
+    ax.plot(res_int["x"], res_int["y"], "o", ms=4, alpha=0.8, label="Data")
+    if np.isfinite(res_int["lam_h"]) and len(res_int["x"]):
+        xs = np.array([float(np.min(res_int["x"])), float(np.max(res_int["x"]))])
+        ax.plot(xs, (res_int["lam_h"] / 3600.0) * xs + res_int.get("intercept", 0.0), "-",
+                lw=2, label=f"λ={res_int['lam_h']:.3f} 1/h, R²={res_int['r2']:.3f}")
+    ax.set_title(t_int, fontsize=11, fontweight="bold")
+    ax.set_xlabel(f"∫({src_label}_ex − {rcv_label}_ex) dt [ppm·s]")
+    ax.set_ylabel(f"{rcv_label}_ex − {rcv_label}_ex(t₀) [ppm]")
+
+    ax = axes[1]
+    ax.plot(res_full["X"], res_full["Y"], "o", ms=4, alpha=0.6, label="Data")
+    if np.isfinite(res_full["lam_h"]) and len(res_full["X"]):
+        xs = np.array([float(np.min(res_full["X"])), float(np.max(res_full["X"]))])
+        ax.plot(xs, (res_full["lam_h"] / 3600.0) * xs, "-",
+                lw=2, label=f"λ={res_full['lam_h']:.3f} 1/h, R²={res_full['r2']:.3f}")
+    ax.set_title(t_full, fontsize=11, fontweight="bold")
+    ax.set_xlabel(f"{src_label}_ex − {rcv_label}_ex [ppm]")
+    ax.set_ylabel(f"d{rcv_label}_ex/dt [ppm/s]")
+
+    ax = axes[2]
+    ax.plot(res_win["times"], res_win["lam_h"], "-o", ms=4, lw=2, label="λ_window(t)")
+    if np.isfinite(res_win["mean_h"]):
+        ax.axhline(res_win["mean_h"], ls="--", lw=1.8, label=f"mean={res_win['mean_h']:.3f}")
+    if np.isfinite(res_win["median_h"]):
+        ax.axhline(res_win["median_h"], ls=":", lw=2.0, label=f"median={res_win['median_h']:.3f}")
+    ax.set_title(f"{t_win} | {win_min}/{step_min} min", fontsize=11, fontweight="bold")
+    ax.set_xlabel("Time")
+    ax.set_ylabel("λ_window (1/h)")
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
+    for lab in ax.get_xticklabels():
+        lab.set_rotation(45)
+
+    for a in axes:
+        a.grid(True)
+        a.legend(frameon=True, fontsize=9, loc="best")
+
+    plt.tight_layout()
     return fig
 
 
@@ -2788,6 +3342,68 @@ abs_ex_thresh = st.sidebar.number_input("Absolute excess threshold (ppm)", min_v
 baseline_fallback_minutes = st.sidebar.number_input("Fallback baseline minutes", min_value=1, value=10, step=1)
 flow_on_th = st.sidebar.number_input("MFC flow-on threshold", min_value=0.0, value=0.2, step=0.1)
 
+st.sidebar.header("5) Air exchange (PK ↔ CAVE)")
+
+baseline_min_samples = st.sidebar.number_input(
+    "Min baseline samples per sensor",
+    min_value=1, value=5, step=1,
+    help="Sensors with fewer valid points in the baseline window get no per-sensor "
+         "baseline and are dropped from the air-exchange analysis (they are NOT "
+         "fallen back to the region baseline, which would reintroduce the offset).",
+)
+noise_sigma_k = st.sidebar.number_input(
+    "Noise safeguard k (× σ)", min_value=0.0, value=5.0, step=1.0,
+    help="Excess threshold used = max(absolute threshold, k × σ of the baseline).",
+)
+
+envelope_walls = st.sidebar.text_input(
+    "PK-envelope sensor groups (in CAVE)", value="FFE,GFE",
+    help="CAVE-side sensors mounted on the PK exterior wall. They read the interface, "
+         "not the room bulk.",
+)
+exclude_envelope_from_bulk = st.sidebar.checkbox(
+    "Keep envelope sensors out of the CAVE bulk", value=True,
+    help="Leaving them in both distorts the CAVE bulk mean and correlates it with the "
+         "interface series it gets compared against.",
+)
+dc_min_ppm = st.sidebar.number_input(
+    "ΔC threshold (ppm)", min_value=0.0, value=100.0, step=10.0,
+    help="The fit uses the longest unbroken stretch where |ΔC| (the gradient across the "
+         "two zones) stays above this value and keeps one sign.",
+)
+
+_c1, _c2 = st.sidebar.columns(2)
+with _c1:
+    lam_win_min = st.number_input("λ window (min)", min_value=1, value=15, step=1)
+with _c2:
+    lam_step_min = st.number_input("λ step (min)", min_value=1, value=5, step=1)
+
+force_zero_intercept = st.sidebar.checkbox(
+    "Force zero intercept (integrated)", value=True,
+    help="The model y = λx has no constant term; leave on unless diagnosing an offset.",
+)
+
+st.sidebar.markdown("**Zone volumes (m³)**")
+v_pk = st.sidebar.number_input("V_PK", min_value=0.0, value=455.67, step=1.0)
+_vc1, _vc2 = st.sidebar.columns(2)
+with _vc1:
+    v_cave_gross = st.number_input("V_CAVE gross", min_value=0.0, value=1917.49, step=1.0)
+with _vc2:
+    v_cave_effective = st.number_input("V_CAVE eff.", min_value=0.0, value=1461.82, step=1.0)
+use_effective_cave_volume = st.sidebar.checkbox(
+    "Use effective CAVE volume", value=True,
+    help="Effective = gross minus the volume occupied by PK. This is the air volume "
+         "that actually takes part in the exchange, so it is the correct choice for λ_CAVE.",
+)
+
+lambda_ext = st.sidebar.number_input(
+    "λ_ext — CAVE ↔ outdoor (1/h)", min_value=0.0, value=0.0, step=0.01, format="%.3f",
+    help="Only used when you solve CAVE's mass balance instead of PK's. CAVE also loses "
+         "tracer to outdoors and that sink cannot be fitted alongside the PK exchange — the "
+         "two are nearly collinear — so it has to be supplied here, from a companion "
+         "experiment at a comparable ΔT. Solving PK needs no such term.",
+)
+
 if "run_analysis" not in st.session_state:
     st.session_state.run_analysis = False
 
@@ -2842,6 +3458,19 @@ cfg = AppConfig(
     abs_ex_thresh=float(abs_ex_thresh),
     baseline_fallback_minutes=int(baseline_fallback_minutes),
     flow_on_th=float(flow_on_th),
+    v_pk=float(v_pk),
+    v_cave_gross=float(v_cave_gross),
+    v_cave_effective=float(v_cave_effective),
+    use_effective_cave_volume=bool(use_effective_cave_volume),
+    baseline_min_samples=int(baseline_min_samples),
+    noise_sigma_k=float(noise_sigma_k),
+    envelope_walls=split_str_list(envelope_walls),
+    exclude_envelope_from_bulk=bool(exclude_envelope_from_bulk),
+    dc_min_ppm=float(dc_min_ppm),
+    lam_win_min=int(lam_win_min),
+    lam_step_min=int(lam_step_min),
+    force_zero_intercept=bool(force_zero_intercept),
+    lambda_ext=float(lambda_ext),
     ylims=default_ylims(),
 )
 
@@ -3002,6 +3631,66 @@ try:
             rel_note = "fallback: full available time"
 
         # -----------------------------
+        # Air exchange: per-sensor baselines and excess series
+        # -----------------------------
+        # Isolated from the rest of the pipeline: if this fails the other tabs
+        # must still render, so the error is captured rather than raised.
+        ae: Dict[str, Any] = {"ok": False, "error": None}
+        try:
+            t_base0, t_base1, base_note = find_baseline_window(stage_defs)
+            if t_base0 is None or t_base1 is None:
+                t_base1 = pd.Timestamp(t_rel0)
+                t_base0 = t_base1 - pd.Timedelta(minutes=cfg.baseline_fallback_minutes)
+                base_note = f"fallback: {cfg.baseline_fallback_minutes} min before release start"
+
+            base_cave, info_cave = per_sensor_baselines(df_cave, t_base0, t_base1, cfg.baseline_min_samples)
+            base_pk, info_pk = per_sensor_baselines(df_pk, t_base0, t_base1, cfg.baseline_min_samples)
+
+            if len(base_cave) == 0 or len(base_pk) == 0:
+                raise ValueError(
+                    "No sensor has enough samples in the baseline window "
+                    f"({t_base0} → {t_base1}). Check the stage log or lower "
+                    "'Min baseline samples per sensor'."
+                )
+
+            df_cave_inc = add_increment_column(df_cave, base_cave)
+            df_pk_inc = add_increment_column(df_pk, base_pk)
+
+            # The PK-envelope sensors sit in CAVE but read the interface, so they are
+            # held out of the CAVE bulk mean; keeping them in would both distort the
+            # bulk and correlate it with the interface series it is compared against.
+            _env = {w.strip().upper() for w in cfg.envelope_walls}
+            _is_env = df_cave_inc["wall"].astype(str).str.strip().str.upper().isin(_env)
+            n_env_sensors = int(df_cave_inc.loc[_is_env, "sensor_number"].nunique())
+            df_cave_bulk = df_cave_inc[~_is_env] if (cfg.exclude_envelope_from_bulk and _is_env.any()) else df_cave_inc
+
+            ex_cave = excess_mean_series(df_cave_bulk, cfg.align_to, cfg.min_sensors)
+            ex_pk = excess_mean_series(df_pk_inc, cfg.align_to, cfg.min_sensors)
+
+            noise_cave = excess_noise_stats(df_cave_bulk, ex_cave, t_base0, t_base1, cfg.align_to)
+            noise_pk = excess_noise_stats(df_pk_inc, ex_pk, t_base0, t_base1, cfg.align_to)
+
+            direction, ex_cave_rel, ex_pk_rel = detect_exchange_direction(ex_cave, ex_pk, t_rel0, t_rel1)
+
+            ae.update({
+                "ok": True,
+                "t_base0": t_base0, "t_base1": t_base1, "base_note": base_note,
+                "base_cave": base_cave, "base_pk": base_pk,
+                "info_cave": info_cave, "info_pk": info_pk,
+                "df_cave_inc": df_cave_inc, "df_pk_inc": df_pk_inc,
+                "ex_cave": ex_cave, "ex_pk": ex_pk,
+                "noise_cave": noise_cave, "noise_pk": noise_pk,
+                "direction_auto": direction,
+                "ex_cave_rel": ex_cave_rel, "ex_pk_rel": ex_pk_rel,
+                "n_env_sensors": n_env_sensors,
+                "env_excluded": bool(cfg.exclude_envelope_from_bulk and n_env_sensors),
+                "cave_base_mean": float(base_cave.mean()) if len(base_cave) else np.nan,
+                "pk_base_mean": float(base_pk.mean()) if len(base_pk) else np.nan,
+            })
+        except Exception as _ae_err:  # noqa: BLE001 - surfaced in the Air Exchange tab
+            ae["error"] = f"{type(_ae_err).__name__}: {_ae_err}"
+
+        # -----------------------------
         # MFC summary
         # -----------------------------
         mfc_summary = None
@@ -3107,7 +3796,7 @@ except Exception as e:
 # =========================================================
 # Tabs
 # =========================================================
-tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs(
+tab1, tab2, tab3, tab4, tab5, tab6, tab_ae, tab7, tab8 = st.tabs(
     [
         "Data Preview",
         "Overall Metrics",
@@ -3115,10 +3804,14 @@ tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs(
         "Sensor CO₂ & Temp",
         "Humidity",
         "Vertical Profiles (Decay)",
+        "Air Exchange",
         "MFC (optional)",
         "Export",
     ]
 )
+
+# Populated by the Air Exchange tab; the Export tab reads it further down.
+ae_export: Optional[Dict[str, Any]] = None
 
 with tab1:
     st.subheader("Input summary")
@@ -4410,6 +5103,523 @@ with tab6:
                     mime="text/csv",
                 )
 
+with tab_ae:
+    st.subheader("Air Exchange (PK ↔ CAVE)")
+    st.write(
+        "Quantifies how much tracer moves between the two zones, using **per-sensor "
+        "increments** rather than raw concentrations. Each sensor is referenced to its own "
+        "baseline, which removes its individual calibration offset — without that, the "
+        "baseline difference between the two regions sits inside every ΔC and biases the "
+        "exchange rate."
+    )
+
+    if not ae.get("ok"):
+        st.error(f"Air-exchange analysis unavailable — {ae.get('error')}")
+    else:
+        _AE_DEFAULTS = {**ZONE_WIDGET_DEFAULTS}
+        _ensure_widget_defaults("ae", _AE_DEFAULTS)
+
+        # ----------------------------------------------------------------
+        # 1) Baseline / calibration diagnostics
+        # ----------------------------------------------------------------
+        st.markdown("### 1 · Baseline & sensor calibration")
+
+        _nc, _np_ = ae["noise_cave"], ae["noise_pk"]
+        _ic, _ip = ae["info_cave"], ae["info_pk"]
+        st.caption(
+            f"Baseline window **{pd.Timestamp(ae['t_base0'])} → {pd.Timestamp(ae['t_base1'])}** "
+            f"({ae['base_note']})"
+        )
+
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("CAVE sensors used", f"{int(_ic['kept'].sum())}",
+                  delta=f"-{int((~_ic['kept']).sum())} dropped" if (~_ic["kept"]).any() else None,
+                  delta_color="off")
+        m2.metric("PK sensors used", f"{int(_ip['kept'].sum())}",
+                  delta=f"-{int((~_ip['kept']).sum())} dropped" if (~_ip["kept"]).any() else None,
+                  delta_color="off")
+        m3.metric("CAVE − PK baseline", f"{ae['cave_base_mean'] - ae['pk_base_mean']:+.2f} ppm")
+        m4.metric("Region-mean noise floor",
+                  f"{max(_nc.get('sigma_mean', np.nan), _np_.get('sigma_mean', np.nan)):.3f} ppm")
+
+        _spread_c = float(_ic.loc[_ic["kept"], "baseline"].max() - _ic.loc[_ic["kept"], "baseline"].min()) if _ic["kept"].any() else np.nan
+        _spread_p = float(_ip.loc[_ip["kept"], "baseline"].max() - _ip.loc[_ip["kept"], "baseline"].min()) if _ip["kept"].any() else np.nan
+        st.caption(
+            f"Between-sensor baseline spread — CAVE **{_spread_c:.1f} ppm**, PK **{_spread_p:.1f} ppm**; "
+            f"single-sensor noise σ — CAVE **{_nc.get('sigma_sensor', np.nan):.2f} ppm**, "
+            f"PK **{_np_.get('sigma_sensor', np.nan):.2f} ppm**. "
+            "A spread far larger than σ means the disagreement is calibration, not mixing."
+        )
+
+        if abs(ae["cave_base_mean"] - ae["pk_base_mean"]) > 5.0:
+            st.info(
+                f"The two regions differ by **{ae['cave_base_mean'] - ae['pk_base_mean']:+.2f} ppm** before "
+                "release. Working in increments removes this from ΔC. It is most likely calibration "
+                "scatter, but a genuine pre-release gradient would look identical — worth a glance "
+                "against the per-sensor spread above before quoting λ to three decimals."
+            )
+
+        with st.expander("Per-sensor baselines and offsets", expanded=False):
+            for _lab, _inf in (("CAVE", _ic), ("PK", _ip)):
+                st.markdown(f"**{_lab}**")
+                _show = _inf.rename(columns={
+                    "sensor_number": "Sensor", "wall": "Wall", "baseline": "Baseline (ppm)",
+                    "offset": "Offset (ppm)", "n": "Baseline pts", "kept": "Used",
+                })
+                st.dataframe(
+                    _show[["Sensor", "Wall", "Baseline (ppm)", "Offset (ppm)", "Baseline pts", "Used"]]
+                    .style.format({"Baseline (ppm)": "{:.1f}", "Offset (ppm)": "{:+.1f}"}),
+                    use_container_width=True, hide_index=True, height=240,
+                )
+                _out = _inf.loc[_inf["kept"]].reindex(
+                    _inf.loc[_inf["kept"], "offset"].abs().sort_values(ascending=False).index
+                ).head(5)
+                if len(_out):
+                    st.caption(
+                        "Largest offsets: "
+                        + ", ".join(f"S{int(r.sensor_number)} ({r.offset:+.0f} ppm)" for r in _out.itertuples())
+                    )
+
+        st.markdown("---")
+
+        # ----------------------------------------------------------------
+        # 2) Direction / roles
+        # ----------------------------------------------------------------
+        st.markdown("### 2 · Release direction and the zone being solved")
+
+        _dir_choice = st.radio(
+            "Release direction (labels the transfer ratio; does not choose the fit)",
+            options=["Auto-detect", DIR_CAVE_TO_PK, DIR_PK_TO_CAVE],
+            index=0, horizontal=True, key="ae__direction",
+        )
+        direction = ae["direction_auto"] if _dir_choice == "Auto-detect" else _dir_choice
+        st.caption(
+            f"Auto-detected **{ae['direction_auto']}** from release-window excess "
+            f"(CAVE {ae['ex_cave_rel']:.1f} ppm vs PK {ae['ex_pk_rel']:.1f} ppm)."
+        )
+
+        if direction == DIR_CAVE_TO_PK:
+            src_label, rcv_label = "CAVE", "PK"
+            ex_src_bulk, ex_rcv = ae["ex_cave"], ae["ex_pk"]
+            noise_src = ae["noise_cave"]
+        else:
+            src_label, rcv_label = "PK", "CAVE"
+            ex_src_bulk, ex_rcv = ae["ex_pk"], ae["ex_cave"]
+            noise_src = ae["noise_pk"]
+
+        st.write(
+            "**Which zone's mass balance to solve is a separate choice from where the tracer "
+            "was released.** PK exchanges only with CAVE, so its balance has a single unknown "
+            "and λ_PK = Q/V_PK is identifiable from two-zone data alone. CAVE's balance also "
+            "carries its loss to outdoors, which cannot be separated from the PK exchange "
+            "without knowing λ_ext independently — the two integrals are almost perfectly "
+            "collinear. Solve PK unless you have a specific reason not to."
+        )
+
+        _solve_zone = st.radio(
+            "Solve λ for",
+            options=["PK (recommended)", "CAVE"],
+            index=0, horizontal=True, key="ae__solve_zone",
+        )
+        solve_pk = _solve_zone.startswith("PK")
+
+        if solve_pk:
+            solve_label, other_label = "PK", "CAVE"
+            ex_solve, ex_other_default = ae["ex_pk"], ae["ex_cave"]
+            df_other_inc = ae["df_cave_inc"]
+            v_solve = cfg.v_pk
+            v_solve_note = "V_PK"
+        else:
+            solve_label, other_label = "CAVE", "PK"
+            ex_solve, ex_other_default = ae["ex_cave"], ae["ex_pk"]
+            df_other_inc = ae["df_pk_inc"]
+            v_solve = cfg.v_cave_effective if cfg.use_effective_cave_volume else cfg.v_cave_gross
+            v_solve_note = "V_CAVE effective" if cfg.use_effective_cave_volume else "V_CAVE gross"
+
+        lambda_ext_per_s = (cfg.lambda_ext / 3600.0) if (not solve_pk and cfg.lambda_ext > 0) else 0.0
+        if not solve_pk:
+            if lambda_ext_per_s:
+                st.warning(
+                    f"Solving CAVE's balance with λ_ext = **{cfg.lambda_ext:.3f} 1/h** applied. "
+                    "The result is only as good as that number, and CAVE's excess is often small "
+                    "enough that its own ventilation and baseline drift dominate the signal. "
+                    "Cross-check against the PK solution."
+                )
+            else:
+                st.error(
+                    "Solving CAVE's balance with **λ_ext = 0** ignores CAVE's loss to outdoors "
+                    "and will bias λ low — often to near zero or negative when CAVE is actively "
+                    "ventilated. Either set λ_ext in the sidebar or switch to solving PK."
+                )
+
+        if ae.get("env_excluded"):
+            st.caption(
+                f"{ae['n_env_sensors']} PK-envelope sensors ({', '.join(cfg.envelope_walls)}) are "
+                "held out of the CAVE bulk mean; they remain available below as a driving concentration."
+            )
+
+        st.markdown("---")
+
+        # ----------------------------------------------------------------
+        # 3) Transfer ratio
+        # ----------------------------------------------------------------
+        st.markdown(f"### 3 · Transfer ratio ({rcv_label}_ex / {src_label}_ex)")
+
+        _sd_series = noise_src.get("sd_series", np.nan)
+        _rel_thresh = cfg.noise_sigma_k * _sd_series if np.isfinite(_sd_series) else 0.0
+        ex_thresh = max(cfg.abs_ex_thresh, _rel_thresh)
+
+        tr = compute_transfer_ratio(ex_src_bulk, ex_rcv, ex_thresh, t_rel0, t_rel1)
+        df_sc, sc_slope, sc_intercept, sc_r2 = fit_excess_scatter(ex_src_bulk, ex_rcv, ex_thresh, t_rel0, t_rel1)
+
+        r1, r2c, r3, r4 = st.columns(4)
+        r1.metric("Mean ratio (release)", f"{tr['factor']:.3f}" if np.isfinite(tr["factor"]) else "n/a",
+                  delta=f"± {tr['sd']:.3f}" if np.isfinite(tr["sd"]) else None, delta_color="off")
+        r2c.metric("Scatter slope", f"{sc_slope:.3f}" if np.isfinite(sc_slope) else "n/a",
+                   delta=f"R² = {sc_r2:.3f}" if np.isfinite(sc_r2) else None, delta_color="off")
+        r3.metric("Points used", f"{tr['n']}")
+        r4.metric("Threshold", f"{ex_thresh:.1f} ppm")
+
+        st.caption(
+            f"Gate is on the **denominator only** ({src_label}_ex > {ex_thresh:.1f} ppm = "
+            f"max({cfg.abs_ex_thresh:.0f}, {cfg.noise_sigma_k:.0f}σ)); "
+            f"{tr['n_gated']} release bins fell below it. A negative numerator is kept as-is — "
+            "clipping it would bias the release mean upward."
+        )
+
+        if tr["n"] < 10:
+            st.warning(
+                f"Only **{tr['n']}** points survive the threshold inside the release window. "
+                "For a short pulse release the receiving zone has barely started to respond, so "
+                "this ratio says almost nothing about the exchange — read λ in section 4 instead."
+            )
+
+        with st.expander("Plot options — transfer ratio", expanded=False):
+            render_save_reset_row("ae", _AE_DEFAULTS)
+            render_font_legend_widgets("ae")
+            st.checkbox("Show full experiment (not just the release window)", key="ae__full_x")
+            st.checkbox("Auto-scale axes", value=True, key="ae__auto_y")
+
+        _full_x = bool(st.session_state.get("ae__full_x", False))
+        _auto_y = bool(st.session_state.get("ae__auto_y", True))
+        _style_ae = _style_from_prefix("ae")
+
+        if go is None:
+            show_matplotlib_fig(plot_io_ratio(
+                tr["io_ex"], tr["factor"], t_rel0, t_rel1, ae["t_base0"], ae["t_base1"],
+                ex_thresh, cfg, src_label=src_label, rcv_label=rcv_label))
+            show_matplotlib_fig(plot_scatter(
+                df_sc, sc_slope, sc_intercept, sc_r2, cfg,
+                src_label=src_label, rcv_label=rcv_label))
+        else:
+            fig_io_p = plot_io_ratio_plotly(
+                tr["io_ex"], tr["factor"], t_rel0, t_rel1, ae["t_base0"], ae["t_base1"],
+                ex_thresh, cfg, src_label=src_label, rcv_label=rcv_label,
+                x_range=(t0, t1) if _full_x else None,
+                y_range=None if _auto_y else cfg.ylims["io_ex"],
+            )
+            apply_plotly_style(fig_io_p, _style_ae)
+            show_plotly_chart(fig_io_p)
+
+            fig_sc_p = plot_scatter_plotly(
+                df_sc, sc_slope, sc_intercept, sc_r2, cfg,
+                src_label=src_label, rcv_label=rcv_label, auto_range=_auto_y,
+            )
+            apply_plotly_style(fig_sc_p, _style_ae)
+            show_plotly_chart(fig_sc_p)
+
+        st.markdown("---")
+
+        # ----------------------------------------------------------------
+        # 4) Exchange rate lambda
+        # ----------------------------------------------------------------
+        st.markdown(f"### 4 · Exchange rate λ_{solve_label}")
+        st.latex(
+            r"\frac{dC_{" + solve_label + r"}}{dt} = \lambda\,(C_{" + other_label
+            + r"} - C_{" + solve_label + r"}) \qquad Q = \lambda \cdot V_{" + solve_label + r"}"
+        )
+
+        _stage_names = [str(n) for (n, _, _, _) in stage_defs] if stage_defs else []
+        if not _stage_names:
+            st.warning(
+                "No stage log uploaded, so no fitting window can be chosen. "
+                "λ needs a stage (Decay, or the Release stage for a long continuous release)."
+            )
+        else:
+            _default_stage = find_stage_by_keyword(stage_defs, "decay") or find_stage_by_keyword(stage_defs, "release")
+            _default_idx = 0
+            if _default_stage is not None:
+                try:
+                    _default_idx = _stage_names.index(str(_default_stage[0]))
+                except ValueError:
+                    _default_idx = 0
+
+            cA, cB = st.columns([1, 1])
+            with cA:
+                _stage_pick = st.selectbox(
+                    "Fitting stage", options=_stage_names, index=_default_idx, key="ae__stage",
+                    help="Decay for a short pulse release; Release for a long continuous one. "
+                         "The model only requires that the solved zone has no internal source, "
+                         "so it works on a rise and on a decay alike.",
+                )
+            with cB:
+                _drive_mode = st.radio(
+                    "Driving concentration",
+                    options=[f"Bulk (all {other_label} sensors)", "Selected sensor groups"],
+                    index=0, key="ae__drive_mode",
+                    help="What drives the solved zone is the concentration at its envelope, "
+                         "which need not equal the other zone's bulk mean when that zone is "
+                         "not well mixed.",
+                )
+
+            _walls_avail = sorted(df_other_inc["wall"].dropna().astype(str).str.strip().unique())
+            _env_set = {w.strip().upper() for w in cfg.envelope_walls}
+            _iface_default = [w for w in _walls_avail if w.upper() in _env_set]
+            _drive_walls: List[str] = []
+            if not _drive_mode.startswith("Bulk"):
+                _drive_walls = st.multiselect(
+                    f"{other_label} sensor groups used as the driving concentration",
+                    options=_walls_avail,
+                    default=_iface_default or _walls_avail,
+                    key="ae__drive_walls",
+                )
+                if _iface_default:
+                    st.caption(
+                        f"Default **{' + '.join(_iface_default)}** — CAVE-side sensors on the PK "
+                        "exterior wall, so they read the concentration right at the envelope."
+                    )
+
+            _stage = next(((n, s, e, c) for (n, s, e, c) in stage_defs if str(n) == str(_stage_pick)), None)
+            _fit_ok = False
+            if _stage is None:
+                st.warning("Selected stage not found.")
+            else:
+                _sname, _sstart, _send, _ = _stage
+
+                if _drive_mode.startswith("Bulk") or not _drive_walls:
+                    ex_drive = ex_other_default
+                    drive_note = f"{other_label} bulk mean"
+                else:
+                    _sub = df_other_inc[df_other_inc["wall"].astype(str).str.strip().isin(_drive_walls)]
+                    _n_sub = int(_sub["sensor_number"].nunique())
+                    ex_drive = excess_mean_series(_sub, cfg.align_to, max(1, min(cfg.min_sensors, _n_sub)))
+                    drive_note = f"{other_label}: {', '.join(_drive_walls)} ({_n_sub} sensors)"
+
+                idx_fit, dC_fit, end_reason = select_exchange_window(
+                    ex_drive, ex_solve, _sstart, _send, cfg.dc_min_ppm
+                )
+
+                if len(idx_fit) < cfg.lam_min_pts_int:
+                    st.warning(
+                        f"Only {len(idx_fit)} usable points in **{_sname}** — need "
+                        f"{cfg.lam_min_pts_int}. {end_reason}. Lower the ΔC threshold or pick "
+                        "another stage."
+                    )
+                else:
+                    solve_fit = ex_solve.reindex(idx_fit).astype(float)
+                    res_int = lambda_integrated(solve_fit, dC_fit, cfg.force_zero_intercept, lambda_ext_per_s)
+                    res_full = lambda_differential(solve_fit, dC_fit, cfg.dc_min_ppm, lambda_ext_per_s)
+                    res_win = lambda_sliding(
+                        res_full["X"], res_full["Y"], res_full["t_mid"],
+                        cfg.lam_win_min, cfg.lam_step_min, cfg.lam_min_pts_win,
+                    )
+                    _fit_ok = True
+
+                    st.caption(
+                        f"Window **{idx_fit[0]:%H:%M:%S} → {idx_fit[-1]:%H:%M:%S}** "
+                        f"({len(idx_fit)} points) — {end_reason}. Driving concentration: {drive_note}."
+                    )
+
+                    _sv = solve_fit.dropna()
+                    _sv_range = float(_sv.max() - _sv.min()) if len(_sv) else np.nan
+                    _dc_med = float(np.nanmedian(np.abs(dC_fit.to_numpy(dtype=float))))
+                    st.caption(
+                        f"Over this window {solve_label}'s own excess moves through "
+                        f"**{_sv_range:.1f} ppm** against a median |ΔC| of **{_dc_med:.0f} ppm**. "
+                        "λ is only identifiable when the solved zone actually responds — a zone "
+                        "that barely moves while the gradient is large is being governed by "
+                        "something other than this exchange."
+                    )
+
+                    if np.isfinite(res_int["lam_h"]) and res_int["lam_h"] <= 0:
+                        st.error(
+                            f"λ came out **non-positive ({res_int['lam_h']:.4f} 1/h)**, which is "
+                            "unphysical. The solved zone's concentration is being driven by "
+                            "something other than exchange with the other zone — most often its own "
+                            "ventilation or baseline drift. Solve the other zone instead."
+                        )
+                    elif np.isfinite(res_int["r2"]) and res_int["r2"] < 0.5:
+                        st.warning(
+                            f"The integrated fit reaches only R² = {res_int['r2']:.3f}. The two-zone "
+                            "model is not describing this window well; treat λ as indicative only."
+                        )
+
+                    q1, q2, q3 = st.columns(3)
+                    q1.metric("λ integrated", f"{res_int['lam_h']:.4f} 1/h" if np.isfinite(res_int["lam_h"]) else "n/a",
+                              delta=f"R² = {res_int['r2']:.3f}" if np.isfinite(res_int["r2"]) else None,
+                              delta_color="off")
+                    q2.metric("λ full regression", f"{res_full['lam_h']:.4f} 1/h" if np.isfinite(res_full["lam_h"]) else "n/a",
+                              delta=f"R² = {res_full['r2']:.3f}" if np.isfinite(res_full["r2"]) else None,
+                              delta_color="off")
+                    q3.metric("λ sliding window", f"{res_win['mean_h']:.4f} 1/h" if np.isfinite(res_win["mean_h"]) else "n/a",
+                              delta=f"median = {res_win['median_h']:.3f}" if np.isfinite(res_win["median_h"]) else None,
+                              delta_color="off")
+
+                    st.caption(
+                        "The integrated method usually shows the higher R² because integration "
+                        "smooths the noise; the differential methods reveal whether λ drifts during "
+                        "the window. They are cross-checks, not alternatives."
+                    )
+
+                    if go is None:
+                        show_matplotlib_fig(plot_lambda_panel_matplotlib(
+                            res_int, res_full, res_win, cfg, other_label, solve_label,
+                            cfg.lam_win_min, cfg.lam_step_min))
+                    else:
+                        gc1, gc2 = st.columns(2)
+                        with gc1:
+                            f1 = plot_lambda_integrated_plotly(res_int, cfg, other_label, solve_label)
+                            apply_plotly_style(f1, _style_ae)
+                            show_plotly_chart(f1)
+                        with gc2:
+                            f2 = plot_lambda_full_plotly(res_full, cfg, other_label, solve_label)
+                            apply_plotly_style(f2, _style_ae)
+                            show_plotly_chart(f2)
+                        f3 = plot_lambda_window_plotly(
+                            res_win, cfg, other_label, solve_label, cfg.lam_win_min, cfg.lam_step_min,
+                            y_range=None if _auto_y else cfg.ylims["lam_window"],
+                        )
+                        apply_plotly_style(f3, _style_ae)
+                        show_plotly_chart(f3)
+
+                    # --------------------------------------------------------
+                    # 5) Q conversion and equilibrium check
+                    # --------------------------------------------------------
+                    st.markdown("---")
+                    st.markdown("### 5 · Exchange flow Q and result summary")
+
+                    lam_ref = res_int["lam_h"]
+                    Q = lam_ref * v_solve if np.isfinite(lam_ref) else np.nan
+                    tau_h = (1.0 / lam_ref) if (np.isfinite(lam_ref) and lam_ref > 0) else np.nan
+
+                    s1, s2, s3 = st.columns(3)
+                    s1.metric("Q (exchange flow)", f"{Q:,.1f} m³/h" if np.isfinite(Q) else "n/a",
+                              delta=f"{v_solve_note} = {v_solve:,.2f} m³", delta_color="off")
+                    s2.metric("τ = 1/λ", f"{tau_h:.2f} h" if np.isfinite(tau_h) else "n/a")
+
+                    _rel_h = ((pd.Timestamp(t_rel1) - pd.Timestamp(t_rel0)).total_seconds() / 3600.0
+                              if (t_rel0 is not None and t_rel1 is not None) else np.nan)
+                    # Step-response bound: valid only if the source held a constant level for
+                    # the whole release. A ramping source leaves the receiver further behind,
+                    # so this is an upper bound on how equilibrated the receiver really is.
+                    _equil = (1.0 - np.exp(-_rel_h / tau_h)) if (np.isfinite(_rel_h) and np.isfinite(tau_h) and tau_h > 0) else np.nan
+                    s3.metric("Release / τ", f"{_rel_h / tau_h:.2f}" if np.isfinite(_rel_h) and np.isfinite(tau_h) else "n/a",
+                              delta=f"≤{100 * _equil:.0f}% equilibrated (step bound)" if np.isfinite(_equil) else None,
+                              delta_color="off")
+
+                    st.caption(
+                        f"Q is the quantity that does not depend on which zone was solved: λ is Q "
+                        f"divided by that zone's volume, so λ_PK and λ_CAVE differ by "
+                        f"{(cfg.v_cave_effective / cfg.v_pk):.2f}× for one and the same airflow. "
+                        "Compare experiments on Q whenever the solved zone or the release "
+                        "direction differs between them."
+                    )
+
+                    _obs_final = np.nan
+                    _io_rel = tr["io_ex"].dropna()
+                    if t_rel0 is not None and t_rel1 is not None:
+                        _io_rel = _io_rel[(_io_rel.index >= pd.Timestamp(t_rel0)) & (_io_rel.index <= pd.Timestamp(t_rel1))]
+                    if len(_io_rel):
+                        _obs_final = float(_io_rel.iloc[-1])
+
+                    if np.isfinite(_equil) and _equil < 0.95:
+                        _msg = (
+                            f"The release lasted **{_rel_h / tau_h:.2f} τ**, so the transfer ratio in "
+                            "section 3 is a **transient** value that still depends on release duration. "
+                            "It is not a steady-state penetration factor and is only comparable across "
+                            "experiments of equal release duration."
+                        )
+                        if np.isfinite(_obs_final):
+                            _msg += (
+                                f" The ratio actually reached **{_obs_final:.3f}** by the end of the "
+                                f"release, against a step-response bound of {_equil:.3f}. The step bound "
+                                "assumes the source held a constant level; a source that ramps up leaves "
+                                "the receiver further behind, so a sizeable gap between the two is "
+                                "expected for a continuous release rather than a sign of error."
+                            )
+                        st.info(_msg)
+
+                    _dT = series_mean_in_window(deltaT_pk_minus_cave, idx_fit[0], idx_fit[-1])
+                    ae_summary = {
+                        "exp_code": cfg.exp_code,
+                        "direction": direction,
+                        "release_source_zone": src_label,
+                        "release_receiver_zone": rcv_label,
+                        "solved_zone": solve_label,
+                        "driving_zone": other_label,
+                        "baseline_window_start": ae["t_base0"],
+                        "baseline_window_end": ae["t_base1"],
+                        "baseline_note": ae["base_note"],
+                        "cave_baseline_mean_ppm": ae["cave_base_mean"],
+                        "pk_baseline_mean_ppm": ae["pk_base_mean"],
+                        "cave_minus_pk_baseline_ppm": ae["cave_base_mean"] - ae["pk_base_mean"],
+                        "cave_sensors_used": int(_ic["kept"].sum()),
+                        "pk_sensors_used": int(_ip["kept"].sum()),
+                        "sigma_sensor_source_ppm": noise_src.get("sigma_sensor", np.nan),
+                        "sigma_regionmean_source_ppm": noise_src.get("sigma_mean", np.nan),
+                        "excess_threshold_ppm": ex_thresh,
+                        "transfer_ratio_mean": tr["factor"],
+                        "transfer_ratio_sd": tr["sd"],
+                        "transfer_ratio_n": tr["n"],
+                        "transfer_ratio_final": _obs_final,
+                        "scatter_slope": sc_slope,
+                        "scatter_intercept": sc_intercept,
+                        "scatter_r2": sc_r2,
+                        "fit_stage": _sname,
+                        "drive_mode": drive_note,
+                        "fit_window_start": idx_fit[0],
+                        "fit_window_end": idx_fit[-1],
+                        "fit_n_points": int(len(idx_fit)),
+                        "fit_end_reason": end_reason,
+                        "dc_threshold_ppm": cfg.dc_min_ppm,
+                        "lambda_integrated_1ph": res_int["lam_h"],
+                        "lambda_integrated_r2": res_int["r2"],
+                        "lambda_full_1ph": res_full["lam_h"],
+                        "lambda_full_r2": res_full["r2"],
+                        "lambda_window_mean_1ph": res_win["mean_h"],
+                        "lambda_window_median_1ph": res_win["median_h"],
+                        "lambda_window_min": cfg.lam_win_min,
+                        "lambda_step_min": cfg.lam_step_min,
+                        "lambda_ext_applied_1ph": cfg.lambda_ext if lambda_ext_per_s else 0.0,
+                        "V_receiver_m3": v_solve,
+                        "V_receiver_basis": v_solve_note,
+                        "Q_m3ph": Q,
+                        "tau_h": tau_h,
+                        "release_over_tau": (_rel_h / tau_h) if (np.isfinite(_rel_h) and np.isfinite(tau_h)) else np.nan,
+                        "equilibrated_fraction_step_bound": _equil,
+                        "deltaT_pk_minus_cave_mean": _dT,
+                    }
+                    ae_summary_df = build_summary_df(ae_summary)
+                    st.dataframe(ae_summary_df, use_container_width=True, hide_index=True)
+
+                    ae_export = {
+                        "summary": ae_summary,
+                        "summary_df": ae_summary_df,
+                        "res_int": res_int,
+                        "res_full": res_full,
+                        "res_win": res_win,
+                        "tr": tr,
+                        "df_sc": df_sc,
+                        "sc": (sc_slope, sc_intercept, sc_r2),
+                        "labels": (src_label, rcv_label),
+                        "lam_labels": (other_label, solve_label),
+                        "ex_thresh": ex_thresh,
+                    }
+
+            if not _fit_ok:
+                st.caption("λ results appear here once a stage with a usable fitting window is selected.")
+
+
 with tab7:
     st.subheader("MFC (optional)")
     st.write(
@@ -4506,6 +5716,83 @@ with tab8:
         mime="text/csv",
     )
 
+    st.markdown("---")
+    st.write("**Air exchange (PK ↔ CAVE)**")
+    if ae_export is None:
+        st.caption(
+            "Nothing to export yet — open the **Air Exchange** tab and select a stage with a "
+            "usable fitting window first."
+        )
+    else:
+        _ae_src, _ae_rcv = ae_export["labels"]
+        _ae_other, _ae_solve = ae_export["lam_labels"]
+        st.caption(f"Release direction: **{_ae_src} → {_ae_rcv}**  ·  λ solved for **{_ae_solve}**")
+        st.dataframe(ae_export["summary_df"], use_container_width=True, hide_index=True)
+
+        st.download_button(
+            label="Download air-exchange summary CSV",
+            data=ae_export["summary_df"].to_csv(index=False).encode("utf-8"),
+            file_name=f"{cfg.exp_code}_air_exchange_summary.csv",
+            mime="text/csv",
+        )
+
+        # One row per experiment: convenient to concatenate across runs later.
+        _wide = pd.DataFrame([ae_export["summary"]])
+        st.download_button(
+            label="Download air-exchange result row (wide CSV)",
+            data=_wide.to_csv(index=False).encode("utf-8"),
+            file_name=f"{cfg.exp_code}_air_exchange_row.csv",
+            mime="text/csv",
+        )
+
+        _buf_ae = io.BytesIO()
+        _fig_ae = plot_lambda_panel_matplotlib(
+            ae_export["res_int"], ae_export["res_full"], ae_export["res_win"],
+            cfg, _ae_other, _ae_solve, cfg.lam_win_min, cfg.lam_step_min,
+        )
+        _fig_ae.savefig(_buf_ae, format="png", dpi=200, bbox_inches="tight")
+        _buf_ae.seek(0)
+        plt.close(_fig_ae)
+        st.download_button(
+            label="Download λ figures (PNG)",
+            data=_buf_ae,
+            file_name=f"{cfg.exp_code}_air_exchange_lambda.png",
+            mime="image/png",
+        )
+
+        _buf_io = io.BytesIO()
+        _fig_io = plot_io_ratio(
+            ae_export["tr"]["io_ex"], ae_export["tr"]["factor"], t_rel0, t_rel1,
+            ae["t_base0"], ae["t_base1"], ae_export["ex_thresh"], cfg,
+            src_label=_ae_src, rcv_label=_ae_rcv,
+        )
+        _fig_io.savefig(_buf_io, format="png", dpi=200, bbox_inches="tight")
+        _buf_io.seek(0)
+        plt.close(_fig_io)
+        st.download_button(
+            label="Download transfer ratio (PNG)",
+            data=_buf_io,
+            file_name=f"{cfg.exp_code}_transfer_ratio.png",
+            mime="image/png",
+        )
+
+        _buf_scp = io.BytesIO()
+        _sl, _ic_, _r2_ = ae_export["sc"]
+        _fig_scp = plot_scatter(
+            ae_export["df_sc"], _sl, _ic_, _r2_, cfg,
+            src_label=_ae_src, rcv_label=_ae_rcv,
+        )
+        _fig_scp.savefig(_buf_scp, format="png", dpi=200, bbox_inches="tight")
+        _buf_scp.seek(0)
+        plt.close(_fig_scp)
+        st.download_button(
+            label="Download excess scatter (PNG)",
+            data=_buf_scp,
+            file_name=f"{cfg.exp_code}_excess_scatter.png",
+            mime="image/png",
+        )
+
+    st.markdown("---")
     st.write("**Download figures (PNG)**")
     with st.expander("Figures", expanded=False):
         st.caption("Matplotlib-rendered PNGs. Interactive Plotly charts are on the other tabs.")
