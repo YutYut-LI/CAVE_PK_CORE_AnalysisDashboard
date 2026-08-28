@@ -2725,10 +2725,13 @@ def plot_scatter_plotly(df_sc, slope, intercept, r2, cfg: AppConfig,
 
 # ---- Air-exchange rate (lambda) figures ------------------------------------
 def _lam_titles(cfg: AppConfig, src_label: str, rcv_label: str) -> Tuple[str, str, str]:
+    # src/rcv here are the driving and solved zones, not the release direction —
+    # spelled out so a PK-release run does not look like it is claiming CAVE → PK.
+    who = f"λ_{rcv_label}, driven by {src_label}"
     return (
-        f"{cfg.exp_code} — λ integrated ({src_label} → {rcv_label})",
-        f"{cfg.exp_code} — λ full regression ({src_label} → {rcv_label})",
-        f"{cfg.exp_code} — λ sliding window ({src_label} → {rcv_label})",
+        f"{cfg.exp_code} — {who} | integrated",
+        f"{cfg.exp_code} — {who} | full regression",
+        f"{cfg.exp_code} — {who} | sliding window",
     )
 
 
@@ -5249,6 +5252,24 @@ with tab_ae:
                 "against the per-sensor spread above before quoting λ to three decimals."
             )
 
+        st.markdown("**What `CAVE_ex` and `PK_ex` mean everywhere below**")
+        st.latex(
+            r"b_i = \overline{C_i}\big|_{\text{baseline window}} \qquad"
+            r"\text{CAVE\_ex}(t) = \frac{1}{N_{\text{CAVE}}}\sum_{i \in \text{CAVE}} \big(C_i(t) - b_i\big)"
+            r" \qquad \text{PK\_ex}(t) = \frac{1}{N_{\text{PK}}}\sum_{i \in \text{PK}} \big(C_i(t) - b_i\big)"
+        )
+        st.markdown(
+            "Each sensor is referenced to **its own** baseline mean `b_i`, then the region average is "
+            "taken over the debiased values — that is the *excess*, or increment, in ppm. It is zero "
+            "during the baseline window by construction, so roughly half the baseline points are "
+            "negative; that is noise around zero and is never clipped, because clipping a symmetric "
+            "noise would bias the mean upward.\n\n"
+            "Everything downstream is built from these two series: the ratio in section 3, and "
+            "ΔC in section 4. Note that per-sensor and per-region baselines are equivalent as long as "
+            "the same sensors report throughout — the per-sensor form is used because it also survives "
+            "sensors dropping in and out."
+        )
+
         with st.expander("Per-sensor baselines and offsets", expanded=False):
             for _lab, _inf in (("CAVE", _ic), ("PK", _ip)):
                 st.markdown(f"**{_lab}**")
@@ -5292,10 +5313,28 @@ with tab_ae:
             src_label, rcv_label = "CAVE", "PK"
             ex_src_bulk, ex_rcv = ae["ex_cave"], ae["ex_pk"]
             noise_src = ae["noise_cave"]
+            st.success(
+                "**Tracer released into CAVE — this is an infiltration experiment.** CAVE plays the "
+                "part of the outdoor environment and PK the building. The question is how much of "
+                "what is outside gets in, and how fast. PK fills up, so ΔC = CAVE_ex − PK_ex is "
+                "**positive** and the ratio in section 3 is a genuine **infiltration factor**."
+            )
         else:
             src_label, rcv_label = "PK", "CAVE"
             ex_src_bulk, ex_rcv = ae["ex_pk"], ae["ex_cave"]
             noise_src = ae["noise_pk"]
+            st.success(
+                "**Tracer released inside PK — this is an emission / decay experiment.** The question "
+                "is the reverse one: how fast something released indoors clears out. PK empties, so "
+                "ΔC = CAVE_ex − PK_ex is **negative** throughout, and section 3 measures "
+                "**exfiltration / dilution — not an infiltration factor**, even though the arithmetic "
+                "is identical.\n\n"
+                "Two things behave differently in this direction. CAVE is 3.2× the volume and is "
+                "usually ventilated, so its excess stays near zero and its response lags — CAVE is "
+                "not a reliable readout here, which is why λ is still taken from PK's own balance. "
+                "And during the release stage PK has an internal source and internal transport of "
+                "its own, so the model does not describe that stretch; fit the decay."
+            )
 
         st.write(
             "**Which zone's mass balance to solve is a separate choice from where the tracer "
@@ -5353,7 +5392,28 @@ with tab_ae:
         # ----------------------------------------------------------------
         # 3) Transfer ratio
         # ----------------------------------------------------------------
-        st.markdown(f"### 3 · Transfer ratio ({rcv_label}_ex / {src_label}_ex)")
+        _ratio_name = "Infiltration factor" if direction == DIR_CAVE_TO_PK else "Exfiltration / dilution ratio"
+        st.markdown(f"### 3 · {_ratio_name}  ({rcv_label}_ex / {src_label}_ex)")
+        st.latex(
+            r"\text{ratio}(t) = \frac{\text{" + rcv_label + r"\_ex}(t)}{\text{" + src_label
+            + r"\_ex}(t)} \quad\text{for}\quad \text{" + src_label + r"\_ex}(t) > \varepsilon"
+        )
+        if direction == DIR_CAVE_TO_PK:
+            st.markdown(
+                "**How much of the environment's excess is present inside the building.** 0 means PK "
+                "is unaffected, 1 means it has fully caught up with CAVE. Since CO₂ is inert and does "
+                "not deposit, the equilibrium value is 1 — anything below that means the release "
+                "simply has not run long enough, not that the envelope filters anything out. This is "
+                "the quantity the infiltration literature calls the infiltration factor."
+            )
+        else:
+            st.markdown(
+                "**How much of what was released inside PK shows up in CAVE.** This is a dilution "
+                "measure, not a penetration measure: CAVE is the larger, ventilated zone, so the "
+                "ratio stays small because the tracer is diluted and vented, not because anything is "
+                "blocking it. **Do not quote this as an infiltration factor** — the arithmetic matches "
+                "but the physics is the reverse one."
+            )
 
         _sd_series = noise_src.get("sd_series", np.nan)
         _rel_thresh = cfg.noise_sigma_k * _sd_series if np.isfinite(_sd_series) else 0.0
@@ -5436,8 +5496,26 @@ with tab_ae:
         # ----------------------------------------------------------------
         st.markdown(f"### 4 · Exchange rate λ_{solve_label}")
         st.latex(
-            r"\frac{dC_{" + solve_label + r"}}{dt} = \lambda\,(C_{" + other_label
-            + r"} - C_{" + solve_label + r"}) \qquad Q = \lambda \cdot V_{" + solve_label + r"}"
+            r"\frac{d\,\text{" + solve_label + r"\_ex}}{dt} = \lambda \cdot \Delta C, \qquad"
+            r"\Delta C = \text{" + other_label + r"\_ex} - \text{" + solve_label + r"\_ex}, \qquad"
+            r"\lambda = \frac{Q}{V_{" + solve_label + r"}}"
+        )
+
+        _filling = (direction == DIR_CAVE_TO_PK) == solve_pk
+        st.markdown(
+            f"The rate at which **{solve_label}**'s concentration changes is proportional to the "
+            f"gradient across the two zones. λ is that constant of proportionality, in 1/h: "
+            f"λ = 0.4 means {solve_label} exchanges 40 % of its own volume with {other_label} per hour."
+            + (
+                f"\n\nHere ΔC is **positive** — {solve_label} is filling, tracer moving in — so "
+                f"{solve_label}\\_ex rises and both axes of the fit are positive."
+                if _filling else
+                f"\n\nHere ΔC is **negative** — {solve_label} is emptying, tracer moving out — so "
+                f"{solve_label}\\_ex falls. Both x and y of the fit go negative together, which leaves "
+                "λ positive and unchanged: the same equation describes filling and emptying, only the "
+                "sign of the gradient flips. That is why the window rule tests **|ΔC|** and only "
+                "requires the sign to stay constant."
+            )
         )
 
         cA, cB = st.columns([1, 1])
@@ -5532,9 +5610,17 @@ with tab_ae:
                 if np.isfinite(res_int["lam_h"]) and res_int["lam_h"] <= 0:
                     st.error(
                         f"λ came out **non-positive ({res_int['lam_h']:.4f} 1/h)**, which is "
-                        "unphysical. The solved zone's concentration is being driven by "
-                        "something other than exchange with the other zone — most often its own "
-                        "ventilation or baseline drift. Solve the other zone instead."
+                        "unphysical. Check these in order:\n\n"
+                        f"1. **Does the window include a stage where {solve_label} had its own "
+                        f"source?** The model assumes {solve_label} is only fed by exchange. If the "
+                        "release went into it, the release stage must be excluded — fit the decay.\n"
+                        f"2. **Is t₀ in the right place?** The fit is anchored at "
+                        f"y = {solve_label}\\_ex(t) − {solve_label}\\_ex(t₀) and forced through the "
+                        "origin, so starting before the zone was loaded makes y keep one sign while "
+                        "ΔC keeps the other, and λ comes out negative.\n"
+                        f"3. **Is {solve_label} actually responding to the other zone**, rather than "
+                        "to its own ventilation or baseline drift? If not, solving the other zone may "
+                        "be the better route."
                     )
                 elif np.isfinite(res_int["r2"]) and res_int["r2"] < 0.5:
                     st.warning(
