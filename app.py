@@ -1354,9 +1354,11 @@ def plot_room_sensors_matplotlib(
     legend_fontsize: int = 8,
     figsize: Tuple[float, float] = (5.2, 3.6),
     ax: Optional[Any] = None,
+    value_label: str = "CO₂",
+    unit: str = "ppm",
 ):
     """One small-multiple panel: every individual sensor in a single PK room,
-    CO2 vs time — matplotlib (not Plotly) so the legend can wrap into a
+    one quantity (CO2 or temperature) vs time — matplotlib (not Plotly) so the legend can wrap into a
     compact multi-column grid like the reference poster, scaling the column
     count with how many sensors are in the room.
 
@@ -1385,8 +1387,8 @@ def plot_room_sensors_matplotlib(
     if stage_defs:
         add_stage_shading(ax, stage_defs, stage_patches)
 
-    ax.set_title(f"{room_label} — CO₂ concentration over time", fontsize=10, fontweight="bold")
-    ax.set_ylabel("CO₂ (ppm)", fontsize=9, fontweight="bold")
+    ax.set_title(f"{room_label} — {value_label} over time", fontsize=10, fontweight="bold")
+    ax.set_ylabel(f"{value_label} ({unit})", fontsize=9, fontweight="bold")
     ax.set_xlabel("Time", fontsize=9, fontweight="bold")
     ax.grid(True, color="0.85", linewidth=0.5)
     ax.set_axisbelow(True)
@@ -1447,6 +1449,28 @@ def plot_room_sensors_matplotlib(
 
 
 @st.cache_resource(show_spinner=False)
+def plot_room_sensors_cached(
+    ts_df: pd.DataFrame,
+    room_label: str,
+    stage_defs,
+    plot_start,
+    plot_end,
+    y_range: Optional[Tuple[float, float]] = None,
+    value_label: str = "CO₂",
+    unit: str = "ppm",
+    cache_version: int = PK_ROOM_PLOT_VERSION,
+):
+    """Standalone per-room figure, memoised. Two floor-plan tabs (CO2 and
+    temperature) each redraw every room on every rerun — Streamlit runs every
+    tab body regardless of which one is on screen — so without this the cost
+    of the second tab is paid on every widget interaction."""
+    return plot_room_sensors_matplotlib(
+        ts_df, room_label, stage_defs, plot_start, plot_end,
+        y_range=y_range, value_label=value_label, unit=unit,
+    )
+
+
+@st.cache_resource(show_spinner=False)
 def plot_pk_floorplan_export(
     floor_key: str,
     pk_cat: pd.DataFrame,
@@ -1458,6 +1482,9 @@ def plot_pk_floorplan_export(
     fp_img_path: Optional[str],
     *,
     y_range: Optional[Tuple[float, float]] = None,
+    value_col: str = "co2",
+    value_label: str = "CO₂",
+    unit: str = "ppm",
     cache_version: int = PK_ROOM_PLOT_VERSION,
 ):
     """One fixed, report-ready composite for a whole floor: every room's
@@ -1597,7 +1624,8 @@ def plot_pk_floorplan_export(
                 pk_cat.loc[pk_cat["room_group"] == item, "sensor_number"].astype(int).tolist()
             )
             ts_room = (
-                sensor_co2_timeseries(df_pk, sensor_ids, align_to, catalog=pk_cat, label_fn=_room_sensor_label)
+                sensor_value_timeseries(df_pk, sensor_ids, align_to, value_col,
+                                        catalog=pk_cat, label_fn=_room_sensor_label)
                 if sensor_ids else pd.DataFrame()
             )
             if len(ts_room) == 0:
@@ -1606,6 +1634,7 @@ def plot_pk_floorplan_export(
                 continue
             plot_room_sensors_matplotlib(
                 ts_room, item, stage_defs, plot_start, plot_end, y_range=y_range, ax=ax,
+                value_label=value_label, unit=unit,
             )
 
     return fig
@@ -4763,6 +4792,112 @@ except Exception as e:
     st.stop()
 
 
+def render_pk_floorplan_tab(prefix: str, value_col: str, value_label: str, unit: str,
+                            default_y: Tuple[float, float]) -> None:
+    """The PK per-room floor-plan view for one measured quantity.
+
+    Both the CO2 and the temperature tab are this same view; only the column
+    read from the data and the axis labelling differ, so the layout, room
+    grouping and floor-plan placement live here once."""
+    st.subheader(f"PK — Rooms by floor plan (sensor-level {value_label})")
+    st.write(
+        f"Every individual sensor in a room, plotted on its own (not the zone mean) — laid out "
+        "around the real floor plan, matching each room's actual position on it."
+    )
+
+    if len(df_pk) == 0:
+        st.info("No PK data in the current upload.")
+        return
+
+    pk_cat_fp = sensor_catalog(df_pk).copy()
+    pk_cat_fp["room_group"] = pk_cat_fp["wall"].apply(_pk_room_group)
+
+    floor_choice = st.radio(
+        "Floor", options=["FF — upper floor", "GF — ground floor"],
+        horizontal=True, key=f"{prefix}__floor",
+    )
+    floor_key = "FF" if floor_choice.startswith("FF") else "GF"
+    floor_columns = PK_FLOORPLAN_LAYOUT[floor_key]
+    fp_img_path = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "assets", "floorplans", PK_FLOORPLAN_IMAGES[floor_key]
+    )
+
+    with st.expander("Plot options (applies to every room on this floor)", expanded=False):
+        st.markdown("**X-axis (time)**")
+        render_x_mode_widgets(prefix, t0, t1, stage_defs)
+        st.checkbox("Use fixed y-limits (all rooms)", key=f"{prefix}__use_fixed_y", value=False)
+        c1, c2 = st.columns(2)
+        with c1:
+            st.number_input("Y min", key=f"{prefix}__y_min", value=float(default_y[0]))
+        with c2:
+            st.number_input("Y max", key=f"{prefix}__y_max", value=float(default_y[1]))
+
+    x0_fp, x1_fp = render_x_controls(prefix, t0, t1, stage_defs)
+    y_range_fp = None
+    if bool(st.session_state.get(f"{prefix}__use_fixed_y", False)):
+        y_range_fp = (
+            float(st.session_state.get(f"{prefix}__y_min", default_y[0])),
+            float(st.session_state.get(f"{prefix}__y_max", default_y[1])),
+        )
+
+    if stage_defs:
+        render_stage_legend_outside(stage_defs)
+
+    def _render_room_chart(room: str) -> None:
+        sensor_ids = sorted(
+            pk_cat_fp.loc[pk_cat_fp["room_group"] == room, "sensor_number"].astype(int).tolist()
+        )
+        if not sensor_ids:
+            st.info(f"**{room}**: no sensors found.")
+            return
+        ts_room = sensor_value_timeseries(
+            df_pk, sensor_ids, cfg.align_to, value_col,
+            catalog=pk_cat_fp, label_fn=_room_sensor_label,
+        )
+        if len(ts_room) == 0:
+            st.info(f"**{room}**: no data in range.")
+            return
+        fig_room = plot_room_sensors_cached(
+            ts_room, room, stage_defs, x0_fp, x1_fp, y_range=y_range_fp,
+            value_label=value_label, unit=unit,
+        )
+        # Every column is the same width (see PK_FLOORPLAN_LAYOUT) and every
+        # room chart uses the same figsize, so stretching to fill the column
+        # renders all rooms at the same final size.
+        st.pyplot(fig_room, use_container_width=True)
+
+    cols = st.columns([c["width"] for c in floor_columns])
+    for col_widget, col_spec in zip(cols, floor_columns):
+        # A column shared with the floor plan (e.g. FF's middle column,
+        # width 1.4663) is wider than a plain room column (width 1.0).
+        # use_container_width=True would stretch that column's room charts
+        # to the full, wider column — larger than every other room. Nest
+        # matching narrow sub-columns, mirroring the download composite's
+        # subgridspec margin trick, so a room chart here renders at the same
+        # width as any other room.
+        col_w = col_spec["width"]
+        margin = (col_w - PK_FLOORPLAN_ROOM_WIDTH) / 2
+        needs_margin = margin > 1e-6
+        with col_widget:
+            for item in col_spec["items"]:
+                if item == "__GAP__":
+                    # Blank spacer, export-composite-only — nothing to render
+                    # on screen, where Streamlit stacks with its own spacing.
+                    continue
+                if item == "__FLOORPLAN__":
+                    if os.path.exists(fp_img_path):
+                        st.image(fp_img_path, use_container_width=True)
+                    else:
+                        st.warning(f"Floor plan image not found at `{fp_img_path}`.")
+                elif needs_margin:
+                    _, room_sub, _ = st.columns([margin, PK_FLOORPLAN_ROOM_WIDTH, margin])
+                    with room_sub:
+                        _render_room_chart(item)
+                else:
+                    _render_room_chart(item)
+
+
+
 # =========================================================
 # Tabs
 # =========================================================
@@ -4771,12 +4906,13 @@ except Exception as e:
 # far below, and this ordering lets each render in its intended place without
 # relocating those blocks. Streamlit only cares about the position of each
 # variable in this list, not what it is named.
-tab1, tab2, tab3, tab9, tab4, tab5, tab6, tab_ae, tab7, tab8 = st.tabs(
+tab1, tab2, tab3, tab9, tab10, tab4, tab5, tab6, tab_ae, tab7, tab8 = st.tabs(
     [
         "Data Preview",
         "Overall Metrics",
         "Zone CO₂ & Temperature",
-        "PK Rooms (Floor Plan)",
+        "PK Rooms — CO₂",
+        "PK Rooms — Temperature",
         "Sensor CO₂ & Temp",
         "Humidity",
         "Vertical Profiles (Decay)",
@@ -5108,105 +5244,10 @@ with tab3:
     st.dataframe(pk_zone_temp.head(20), use_container_width=True)
 
 with tab9:
-    st.subheader("PK — Rooms by floor plan (sensor-level CO₂)")
-    st.write(
-        "Every individual CO₂ sensor in a room, plotted on its own (not the zone mean) — laid out "
-        "around the real floor plan, matching each room's actual position on it."
-    )
+    render_pk_floorplan_tab("pkfp", "co2", "CO₂", "ppm", (350.0, 2000.0))
 
-    if len(df_pk) == 0:
-        st.info("No PK data in the current upload.")
-    else:
-        pk_cat_fp = pk_cat if "pk_cat" in dir() else sensor_catalog(df_pk)
-        pk_cat_fp = pk_cat_fp.copy()
-        pk_cat_fp["room_group"] = pk_cat_fp["wall"].apply(_pk_room_group)
-
-        floor_choice = st.radio(
-            "Floor", options=["FF — upper floor", "GF — ground floor"],
-            horizontal=True, key="pkfp__floor",
-        )
-        floor_key = "FF" if floor_choice.startswith("FF") else "GF"
-        floor_columns = PK_FLOORPLAN_LAYOUT[floor_key]
-        fp_img_path = os.path.join(
-            os.path.dirname(os.path.abspath(__file__)), "assets", "floorplans", PK_FLOORPLAN_IMAGES[floor_key]
-        )
-
-        with st.expander("Plot options (applies to every room on this floor)", expanded=False):
-            st.markdown("**X-axis (time)**")
-            render_x_mode_widgets("pkfp", t0, t1, stage_defs)
-            st.checkbox("Use fixed y-limits (all rooms)", key="pkfp__use_fixed_y", value=False)
-            c1, c2 = st.columns(2)
-            with c1:
-                st.number_input("Y min", key="pkfp__y_min", value=350.0)
-            with c2:
-                st.number_input("Y max", key="pkfp__y_max", value=2000.0)
-
-        x0_fp, x1_fp = render_x_controls("pkfp", t0, t1, stage_defs)
-        use_fy_fp = bool(st.session_state.get("pkfp__use_fixed_y", False))
-        y_range_fp = None
-        if use_fy_fp:
-            y_range_fp = (
-                float(st.session_state.get("pkfp__y_min", 350.0)),
-                float(st.session_state.get("pkfp__y_max", 2000.0)),
-            )
-
-        if stage_defs:
-            render_stage_legend_outside(stage_defs)
-
-        def _render_room_chart(room: str) -> None:
-            sensor_ids = sorted(
-                pk_cat_fp.loc[pk_cat_fp["room_group"] == room, "sensor_number"].astype(int).tolist()
-            )
-            if not sensor_ids:
-                st.info(f"**{room}**: no sensors found.")
-                return
-            ts_room = sensor_co2_timeseries(
-                df_pk, sensor_ids, cfg.align_to, catalog=pk_cat_fp, label_fn=_room_sensor_label,
-            )
-            if len(ts_room) == 0:
-                st.info(f"**{room}**: no data in range.")
-                return
-            fig_room = plot_room_sensors_matplotlib(
-                ts_room, room, stage_defs, x0_fp, x1_fp, y_range=y_range_fp,
-            )
-            # Every column is the same width (see PK_FLOORPLAN_LAYOUT) and
-            # every room chart uses the same figsize, so stretching to fill
-            # the column renders all rooms at the same final size.
-            st.pyplot(fig_room, use_container_width=True)
-            plt.close(fig_room)
-
-        cols = st.columns([c["width"] for c in floor_columns])
-        for col_widget, col_spec in zip(cols, floor_columns):
-            # A column shared with the floor plan (e.g. FF's middle column,
-            # width 1.4663) is wider than a plain room column (width 1.0).
-            # use_container_width=True would stretch that column's room
-            # charts (FF03/FF05) to the full, wider column — larger than
-            # every other room. Nest matching narrow sub-columns, mirroring
-            # the download composite's subgridspec margin trick, so a room
-            # chart here renders at the same width as any other room.
-            col_w = col_spec["width"]
-            margin = (col_w - PK_FLOORPLAN_ROOM_WIDTH) / 2
-            needs_margin = margin > 1e-6
-            with col_widget:
-                for item in col_spec["items"]:
-                    if item == "__GAP__":
-                        # Blank spacer, export-composite-only (keeps rooms
-                        # in the same column from crowding each other and
-                        # the floor plan there) — nothing to render on
-                        # screen, where Streamlit just stacks content with
-                        # its own natural spacing.
-                        continue
-                    if item == "__FLOORPLAN__":
-                        if os.path.exists(fp_img_path):
-                            st.image(fp_img_path, use_container_width=True)
-                        else:
-                            st.warning(f"Floor plan image not found at `{fp_img_path}`.")
-                    elif needs_margin:
-                        _, room_sub, _ = st.columns([margin, PK_FLOORPLAN_ROOM_WIDTH, margin])
-                        with room_sub:
-                            _render_room_chart(item)
-                    else:
-                        _render_room_chart(item)
+with tab10:
+    render_pk_floorplan_tab("pkfp_t", "temperature", "Temperature", "°C", (10.0, 35.0))
 
 with tab4:
     st.subheader("Sensor CO₂ & temperature compare")
@@ -7157,6 +7198,16 @@ with tab8:
                         float(st.session_state.get("pkfp__y_max", 2000.0)),
                     )
 
+                # The temperature floor-plan tab has its own x-window and
+                # y-limit widgets, so its exports mirror that tab, not the CO2 one.
+                x0_pkfp_t_exp, x1_pkfp_t_exp = render_x_controls("pkfp_t", t0, t1, stage_defs)
+                y_range_pkfp_t_exp = None
+                if bool(st.session_state.get("pkfp_t__use_fixed_y", False)):
+                    y_range_pkfp_t_exp = (
+                        float(st.session_state.get("pkfp_t__y_min", 10.0)),
+                        float(st.session_state.get("pkfp_t__y_max", 35.0)),
+                    )
+
                 for floor_key_exp, floor_label_exp in [("FF", "upper floor"), ("GF", "ground floor")]:
                     fp_img_path_exp = os.path.join(
                         os.path.dirname(os.path.abspath(__file__)), "assets", "floorplans",
@@ -7169,6 +7220,22 @@ with tab8:
                     _download_row(
                         fig_pkrooms_exp, f"pk_rooms_{floor_key_exp.lower()}",
                         f"PK rooms — {floor_label_exp}",
+                    )
+                    st.markdown("---")
+
+                for floor_key_exp, floor_label_exp in [("FF", "upper floor"), ("GF", "ground floor")]:
+                    fp_img_path_exp = os.path.join(
+                        os.path.dirname(os.path.abspath(__file__)), "assets", "floorplans",
+                        PK_FLOORPLAN_IMAGES[floor_key_exp],
+                    )
+                    fig_pkrooms_t_exp = plot_pk_floorplan_export(
+                        floor_key_exp, pk_cat_exp, df_pk, cfg.align_to, stage_defs,
+                        x0_pkfp_t_exp, x1_pkfp_t_exp, fp_img_path_exp, y_range=y_range_pkfp_t_exp,
+                        value_col="temperature", value_label="Temperature", unit="°C",
+                    )
+                    _download_row(
+                        fig_pkrooms_t_exp, f"pk_rooms_temperature_{floor_key_exp.lower()}",
+                        f"PK rooms temperature — {floor_label_exp}",
                     )
                     st.markdown("---")
 
