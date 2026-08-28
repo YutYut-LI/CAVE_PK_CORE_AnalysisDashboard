@@ -1754,14 +1754,15 @@ def plot_mfc(mfc_df, t_on, t_off, t_rel0, t_rel1, cfg: AppConfig, *, line_width:
 
 
 def plot_io_ratio(io_ex, infiltration_factor, t_rel0, t_rel1, t_base0, t_base1, ex_thresh, cfg: AppConfig,
-                  *, src_label: str = "CAVE", rcv_label: str = "PK"):
+                  *, src_label: str = "CAVE", rcv_label: str = "PK",
+                  window_label: str = "Release window"):
     fig, ax = plt.subplots(figsize=(14, 5))
     ax.plot(io_ex.index, io_ex.values, linewidth=2.0,
             label=f"ratio(t) = {rcv_label}_ex / {src_label}_ex (thresholded)")
-    ax.axvspan(t_rel0, t_rel1, alpha=0.15, label="Release window (Stage2)")
+    ax.axvspan(t_rel0, t_rel1, alpha=0.15, label=window_label)
 
     if np.isfinite(infiltration_factor):
-        ax.axhline(infiltration_factor, linestyle="--", linewidth=2.0, label=f"mean in Release = {infiltration_factor:.3f}")
+        ax.axhline(infiltration_factor, linestyle="--", linewidth=2.0, label=f"mean = {infiltration_factor:.3f}")
 
     ax.axvspan(t_base0, t_base1, alpha=0.08, label="Baseline window")
     ax.text(0.01, 0.02, f"Threshold: {src_label}_ex > {ex_thresh:.1f} ppm", transform=ax.transAxes, fontsize=9, va="bottom", ha="left")
@@ -2289,6 +2290,94 @@ def render_save_reset_row(prefix: str, defaults: Dict[str, Any]) -> None:
         )
 
 
+def render_window_picker(prefix: str, stage_defs, t_lo, t_hi, default_keywords: Tuple[str, ...],
+                         *, stage_help: str = "") -> Tuple[Any, Any, str]:
+    """Time-window chooser: pick a logged stage, or set the window by hand.
+
+    Stage boundaries in the experiment log are nominal. The moment a decay
+    really starts — mixing switched off, release valve closed — often sits
+    minutes away from the logged time and has to be read off the curves, so
+    manual mode seeds itself from the chosen stage and lets it be nudged.
+
+    Returns (t0, t1, note).
+    """
+    stage_names = [str(n) for (n, _, _, _) in stage_defs] if stage_defs else []
+
+    def _stage_by_name(name):
+        return next(((n, pd.Timestamp(s), pd.Timestamp(e), c)
+                     for (n, s, e, c) in (stage_defs or []) if str(n) == str(name)), None)
+
+    default_stage = None
+    for kw in default_keywords:
+        default_stage = find_stage_by_keyword(stage_defs, kw)
+        if default_stage is not None:
+            break
+    if default_stage is None and stage_defs:
+        n, s, e, c = stage_defs[0]
+        default_stage = (n, pd.Timestamp(s), pd.Timestamp(e), c)
+
+    modes = ["Stage", "Manual"] if stage_names else ["Manual"]
+    mode = st.radio("Window", options=modes, index=0, horizontal=True, key=f"{prefix}__win_mode")
+
+    if mode == "Stage":
+        idx = 0
+        if default_stage is not None:
+            try:
+                idx = stage_names.index(str(default_stage[0]))
+            except ValueError:
+                idx = 0
+        pick = st.selectbox("Stage", options=stage_names, index=idx,
+                            key=f"{prefix}__stage", help=stage_help)
+        chosen = _stage_by_name(pick)
+        if chosen is None:
+            return None, None, "stage not found"
+        return chosen[1], chosen[2], f"stage: {chosen[0]}"
+
+    # ---- Manual ----------------------------------------------------------
+    lo = pd.Timestamp(t_lo).to_pydatetime()
+    hi = pd.Timestamp(t_hi).to_pydatetime()
+
+    # Seed from whichever stage is currently selected, so switching to Manual
+    # starts from where you were rather than jumping somewhere unrelated.
+    seed = _stage_by_name(st.session_state.get(f"{prefix}__stage")) or default_stage
+    if seed is not None:
+        a = max(lo, seed[1].to_pydatetime())
+        b = min(hi, seed[2].to_pydatetime())
+    else:
+        a, b = lo, hi
+    if b <= a:
+        a, b = lo, hi
+
+    typed = st.checkbox("Type exact timestamps instead of dragging", key=f"{prefix}__typed")
+    if typed:
+        # Carry over wherever the slider was left, so switching to typed entry
+        # fine-tunes the current window instead of resetting it to the stage.
+        dragged = st.session_state.get(f"{prefix}__manual")
+        if isinstance(dragged, (tuple, list)) and len(dragged) == 2:
+            a, b = dragged[0], dragged[1]
+    if typed:
+        c1, c2 = st.columns(2)
+        with c1:
+            s_txt = st.text_input("Start", value=f"{a:%Y-%m-%d %H:%M:%S}", key=f"{prefix}__t0_txt")
+        with c2:
+            e_txt = st.text_input("End", value=f"{b:%Y-%m-%d %H:%M:%S}", key=f"{prefix}__t1_txt")
+        t0 = pd.to_datetime(s_txt, errors="coerce")
+        t1 = pd.to_datetime(e_txt, errors="coerce")
+        if pd.isna(t0) or pd.isna(t1) or t1 <= t0:
+            st.error("Could not read those timestamps (expected `YYYY-MM-DD HH:MM:SS`, end after start) — falling back to the stage window.")
+            return pd.Timestamp(a), pd.Timestamp(b), "manual (invalid input, stage window used)"
+        return t0, t1, "manual (typed)"
+
+    span = hi - lo
+    step = _dt.timedelta(minutes=1) if span > _dt.timedelta(hours=2) else _dt.timedelta(seconds=10)
+    sel = st.slider(
+        "Drag the ends to set the window",
+        min_value=lo, max_value=hi, value=(a, b), step=step,
+        format="YYYY-MM-DD HH:mm", key=f"{prefix}__manual",
+    )
+    return pd.Timestamp(sel[0]), pd.Timestamp(sel[1]), "manual (slider)"
+
+
 def _y_pair_from_prefix(prefix: str, fb_lo: float, fb_hi: float) -> Tuple[float, float]:
     lo = float(st.session_state.get(f"{prefix}__y_min", fb_lo))
     hi = float(st.session_state.get(f"{prefix}__y_max", fb_hi))
@@ -2519,6 +2608,7 @@ def plot_zone_single_plotly(
 
 def plot_io_ratio_plotly(io_ex, infiltration_factor, t_rel0, t_rel1, t_base0, t_base1, ex_thresh, cfg: AppConfig,
                          *, src_label: str = "CAVE", rcv_label: str = "PK",
+                         window_label: str = "Release",
                          x_range: Optional[Tuple[Any, Any]] = None,
                          y_range: Optional[Tuple[float, float]] = None):
     _require_plotly()
@@ -2539,7 +2629,7 @@ def plot_io_ratio_plotly(io_ex, infiltration_factor, t_rel0, t_rel1, t_base0, t_
 
     # Shaded windows
     if (t_rel0 is not None) and (t_rel1 is not None):
-        fig.add_vrect(x0=t_rel0, x1=t_rel1, fillcolor="orange", opacity=0.15, line_width=0, annotation_text="Release", annotation_position="top left")
+        fig.add_vrect(x0=t_rel0, x1=t_rel1, fillcolor="orange", opacity=0.15, line_width=0, annotation_text=window_label, annotation_position="top left")
     if (t_base0 is not None) and (t_base1 is not None):
         fig.add_vrect(x0=t_base0, x1=t_base1, fillcolor="gray", opacity=0.10, line_width=0, annotation_text="Baseline", annotation_position="bottom left")
 
@@ -5269,11 +5359,20 @@ with tab_ae:
         _rel_thresh = cfg.noise_sigma_k * _sd_series if np.isfinite(_sd_series) else 0.0
         ex_thresh = max(cfg.abs_ex_thresh, _rel_thresh)
 
-        tr = compute_transfer_ratio(ex_src_bulk, ex_rcv, ex_thresh, t_rel0, t_rel1)
-        df_sc, sc_slope, sc_intercept, sc_r2 = fit_excess_scatter(ex_src_bulk, ex_rcv, ex_thresh, t_rel0, t_rel1)
+        tr_t0, tr_t1, tr_note = render_window_picker(
+            "ae_tr", stage_defs, t0, t1, ("release",),
+            stage_help="The ratio is conventionally taken over the release stage, but any "
+                       "stage works — and Manual lets you set the window by eye.",
+        )
+        if tr_t0 is None or tr_t1 is None:
+            tr_t0, tr_t1, tr_note = t_rel0, t_rel1, "fallback: release window"
+        st.caption(f"Ratio window **{pd.Timestamp(tr_t0):%Y-%m-%d %H:%M:%S} → {pd.Timestamp(tr_t1):%H:%M:%S}** ({tr_note}).")
+
+        tr = compute_transfer_ratio(ex_src_bulk, ex_rcv, ex_thresh, tr_t0, tr_t1)
+        df_sc, sc_slope, sc_intercept, sc_r2 = fit_excess_scatter(ex_src_bulk, ex_rcv, ex_thresh, tr_t0, tr_t1)
 
         r1, r2c, r3, r4 = st.columns(4)
-        r1.metric("Mean ratio (release)", f"{tr['factor']:.3f}" if np.isfinite(tr["factor"]) else "n/a",
+        r1.metric("Mean ratio (window)", f"{tr['factor']:.3f}" if np.isfinite(tr["factor"]) else "n/a",
                   delta=f"± {tr['sd']:.3f}" if np.isfinite(tr["sd"]) else None, delta_color="off")
         r2c.metric("Scatter slope", f"{sc_slope:.3f}" if np.isfinite(sc_slope) else "n/a",
                    delta=f"R² = {sc_r2:.3f}" if np.isfinite(sc_r2) else None, delta_color="off")
@@ -5283,15 +5382,15 @@ with tab_ae:
         st.caption(
             f"Gate is on the **denominator only** ({src_label}_ex > {ex_thresh:.1f} ppm = "
             f"max({cfg.abs_ex_thresh:.0f}, {cfg.noise_sigma_k:.0f}σ)); "
-            f"{tr['n_gated']} release bins fell below it. A negative numerator is kept as-is — "
-            "clipping it would bias the release mean upward."
+            f"{tr['n_gated']} bins in the window fell below it. A negative numerator is kept "
+            "as-is — clipping it would bias the mean upward."
         )
 
         if tr["n"] < 10:
             st.warning(
-                f"Only **{tr['n']}** points survive the threshold inside the release window. "
+                f"Only **{tr['n']}** points survive the threshold inside this window. "
                 "For a short pulse release the receiving zone has barely started to respond, so "
-                "this ratio says almost nothing about the exchange — read λ in section 4 instead."
+                "the ratio says almost nothing about the exchange — read λ in section 4 instead."
             )
 
         with st.expander("Plot options — transfer ratio", expanded=False):
@@ -5306,15 +5405,17 @@ with tab_ae:
 
         if go is None:
             show_matplotlib_fig(plot_io_ratio(
-                tr["io_ex"], tr["factor"], t_rel0, t_rel1, ae["t_base0"], ae["t_base1"],
-                ex_thresh, cfg, src_label=src_label, rcv_label=rcv_label))
+                tr["io_ex"], tr["factor"], tr_t0, tr_t1, ae["t_base0"], ae["t_base1"],
+                ex_thresh, cfg, src_label=src_label, rcv_label=rcv_label,
+                window_label="Analysis window"))
             show_matplotlib_fig(plot_scatter(
                 df_sc, sc_slope, sc_intercept, sc_r2, cfg,
                 src_label=src_label, rcv_label=rcv_label))
         else:
             fig_io_p = plot_io_ratio_plotly(
-                tr["io_ex"], tr["factor"], t_rel0, t_rel1, ae["t_base0"], ae["t_base1"],
+                tr["io_ex"], tr["factor"], tr_t0, tr_t1, ae["t_base0"], ae["t_base1"],
                 ex_thresh, cfg, src_label=src_label, rcv_label=rcv_label,
+                window_label="Analysis window",
                 x_range=(t0, t1) if _full_x else None,
                 y_range=None if _auto_y else cfg.ylims["io_ex"],
             )
@@ -5339,285 +5440,280 @@ with tab_ae:
             + r"} - C_{" + solve_label + r"}) \qquad Q = \lambda \cdot V_{" + solve_label + r"}"
         )
 
-        _stage_names = [str(n) for (n, _, _, _) in stage_defs] if stage_defs else []
-        if not _stage_names:
+        cA, cB = st.columns([1, 1])
+        with cA:
+            _fit_t0, _fit_t1, _fit_note = render_window_picker(
+                "ae_lam", stage_defs, t0, t1, ("decay", "release"),
+                stage_help="Decay for a short pulse release; Release for a long continuous "
+                           "one. The model only requires that the solved zone has no internal "
+                           "source, so it works on a rise and on a decay alike.",
+            )
+        with cB:
+            _drive_mode = st.radio(
+                "Driving concentration",
+                options=[f"Bulk (all {other_label} sensors)", "Selected sensor groups"],
+                index=0, key="ae__drive_mode",
+                help="What drives the solved zone is the concentration at its envelope, "
+                     "which need not equal the other zone's bulk mean when that zone is "
+                     "not well mixed.",
+            )
+
+        _walls_avail = sorted(df_other_inc["wall"].dropna().astype(str).str.strip().unique())
+        _env_set = {w.strip().upper() for w in cfg.envelope_walls}
+        _iface_default = [w for w in _walls_avail if w.upper() in _env_set]
+        _drive_walls: List[str] = []
+        if not _drive_mode.startswith("Bulk"):
+            _drive_walls = st.multiselect(
+                f"{other_label} sensor groups used as the driving concentration",
+                options=_walls_avail,
+                default=_iface_default or _walls_avail,
+                key="ae__drive_walls",
+            )
+            if _iface_default:
+                st.caption(
+                    f"Default **{' + '.join(_iface_default)}** — CAVE-side sensors on the PK "
+                    "exterior wall, so they read the concentration right at the envelope."
+                )
+
+        _fit_ok = False
+        if _fit_t0 is None or _fit_t1 is None:
             st.warning(
-                "No stage log uploaded, so no fitting window can be chosen. "
-                "λ needs a stage (Decay, or the Release stage for a long continuous release)."
+                "No fitting window. Upload a stage log, or switch the window control to "
+                "**Manual** and set the start and end by hand."
             )
         else:
-            _default_stage = find_stage_by_keyword(stage_defs, "decay") or find_stage_by_keyword(stage_defs, "release")
-            _default_idx = 0
-            if _default_stage is not None:
-                try:
-                    _default_idx = _stage_names.index(str(_default_stage[0]))
-                except ValueError:
-                    _default_idx = 0
+            _sname, _sstart, _send = _fit_note, _fit_t0, _fit_t1
 
-            cA, cB = st.columns([1, 1])
-            with cA:
-                _stage_pick = st.selectbox(
-                    "Fitting stage", options=_stage_names, index=_default_idx, key="ae__stage",
-                    help="Decay for a short pulse release; Release for a long continuous one. "
-                         "The model only requires that the solved zone has no internal source, "
-                         "so it works on a rise and on a decay alike.",
-                )
-            with cB:
-                _drive_mode = st.radio(
-                    "Driving concentration",
-                    options=[f"Bulk (all {other_label} sensors)", "Selected sensor groups"],
-                    index=0, key="ae__drive_mode",
-                    help="What drives the solved zone is the concentration at its envelope, "
-                         "which need not equal the other zone's bulk mean when that zone is "
-                         "not well mixed.",
-                )
-
-            _walls_avail = sorted(df_other_inc["wall"].dropna().astype(str).str.strip().unique())
-            _env_set = {w.strip().upper() for w in cfg.envelope_walls}
-            _iface_default = [w for w in _walls_avail if w.upper() in _env_set]
-            _drive_walls: List[str] = []
-            if not _drive_mode.startswith("Bulk"):
-                _drive_walls = st.multiselect(
-                    f"{other_label} sensor groups used as the driving concentration",
-                    options=_walls_avail,
-                    default=_iface_default or _walls_avail,
-                    key="ae__drive_walls",
-                )
-                if _iface_default:
-                    st.caption(
-                        f"Default **{' + '.join(_iface_default)}** — CAVE-side sensors on the PK "
-                        "exterior wall, so they read the concentration right at the envelope."
-                    )
-
-            _stage = next(((n, s, e, c) for (n, s, e, c) in stage_defs if str(n) == str(_stage_pick)), None)
-            _fit_ok = False
-            if _stage is None:
-                st.warning("Selected stage not found.")
+            if _drive_mode.startswith("Bulk") or not _drive_walls:
+                ex_drive = ex_other_default
+                drive_note = f"{other_label} bulk mean"
             else:
-                _sname, _sstart, _send, _ = _stage
+                _sub = df_other_inc[df_other_inc["wall"].astype(str).str.strip().isin(_drive_walls)]
+                _n_sub = int(_sub["sensor_number"].nunique())
+                ex_drive = excess_mean_series(_sub, cfg.align_to, max(1, min(cfg.min_sensors, _n_sub)))
+                drive_note = f"{other_label}: {', '.join(_drive_walls)} ({_n_sub} sensors)"
 
-                if _drive_mode.startswith("Bulk") or not _drive_walls:
-                    ex_drive = ex_other_default
-                    drive_note = f"{other_label} bulk mean"
-                else:
-                    _sub = df_other_inc[df_other_inc["wall"].astype(str).str.strip().isin(_drive_walls)]
-                    _n_sub = int(_sub["sensor_number"].nunique())
-                    ex_drive = excess_mean_series(_sub, cfg.align_to, max(1, min(cfg.min_sensors, _n_sub)))
-                    drive_note = f"{other_label}: {', '.join(_drive_walls)} ({_n_sub} sensors)"
+            idx_fit, dC_fit, end_reason = select_exchange_window(
+                ex_drive, ex_solve, _sstart, _send, cfg.dc_min_ppm
+            )
 
-                idx_fit, dC_fit, end_reason = select_exchange_window(
-                    ex_drive, ex_solve, _sstart, _send, cfg.dc_min_ppm
+            if len(idx_fit) < cfg.lam_min_pts_int:
+                st.warning(
+                    f"Only {len(idx_fit)} usable points in **{_sname}** — need "
+                    f"{cfg.lam_min_pts_int}. {end_reason}. Lower the ΔC threshold or pick "
+                    "another stage."
+                )
+            else:
+                solve_fit = ex_solve.reindex(idx_fit).astype(float)
+                res_int = lambda_integrated(solve_fit, dC_fit, cfg.force_zero_intercept, lambda_ext_per_s)
+                res_full = lambda_differential(solve_fit, dC_fit, cfg.dc_min_ppm, lambda_ext_per_s)
+                res_win = lambda_sliding(
+                    res_full["X"], res_full["Y"], res_full["t_mid"],
+                    cfg.lam_win_min, cfg.lam_step_min, cfg.lam_min_pts_win,
+                )
+                _fit_ok = True
+
+                st.caption(
+                    f"Window **{idx_fit[0]:%H:%M:%S} → {idx_fit[-1]:%H:%M:%S}** "
+                    f"({len(idx_fit)} points) — {end_reason}. Driving concentration: {drive_note}."
                 )
 
-                if len(idx_fit) < cfg.lam_min_pts_int:
+                _sv = solve_fit.dropna()
+                _sv_range = float(_sv.max() - _sv.min()) if len(_sv) else np.nan
+                _dc_med = float(np.nanmedian(np.abs(dC_fit.to_numpy(dtype=float))))
+                st.caption(
+                    f"Over this window {solve_label}'s own excess moves through "
+                    f"**{_sv_range:.1f} ppm** against a median |ΔC| of **{_dc_med:.0f} ppm**. "
+                    "λ is only identifiable when the solved zone actually responds — a zone "
+                    "that barely moves while the gradient is large is being governed by "
+                    "something other than this exchange."
+                )
+
+                if np.isfinite(res_int["lam_h"]) and res_int["lam_h"] <= 0:
+                    st.error(
+                        f"λ came out **non-positive ({res_int['lam_h']:.4f} 1/h)**, which is "
+                        "unphysical. The solved zone's concentration is being driven by "
+                        "something other than exchange with the other zone — most often its own "
+                        "ventilation or baseline drift. Solve the other zone instead."
+                    )
+                elif np.isfinite(res_int["r2"]) and res_int["r2"] < 0.5:
                     st.warning(
-                        f"Only {len(idx_fit)} usable points in **{_sname}** — need "
-                        f"{cfg.lam_min_pts_int}. {end_reason}. Lower the ΔC threshold or pick "
-                        "another stage."
+                        f"The integrated fit reaches only R² = {res_int['r2']:.3f}. The two-zone "
+                        "model is not describing this window well; treat λ as indicative only."
                     )
+
+                q1, q2, q3 = st.columns(3)
+                q1.metric("λ integrated", f"{res_int['lam_h']:.4f} 1/h" if np.isfinite(res_int["lam_h"]) else "n/a",
+                          delta=f"R² = {res_int['r2']:.3f}" if np.isfinite(res_int["r2"]) else None,
+                          delta_color="off")
+                q2.metric("λ full regression", f"{res_full['lam_h']:.4f} 1/h" if np.isfinite(res_full["lam_h"]) else "n/a",
+                          delta=f"R² = {res_full['r2']:.3f}" if np.isfinite(res_full["r2"]) else None,
+                          delta_color="off")
+                q3.metric("λ sliding window", f"{res_win['mean_h']:.4f} 1/h" if np.isfinite(res_win["mean_h"]) else "n/a",
+                          delta=f"median = {res_win['median_h']:.3f}" if np.isfinite(res_win["median_h"]) else None,
+                          delta_color="off")
+
+                st.caption(
+                    "The integrated method usually shows the higher R² because integration "
+                    "smooths the noise; the differential methods reveal whether λ drifts during "
+                    "the window. They are cross-checks, not alternatives."
+                )
+
+                if go is None:
+                    show_matplotlib_fig(plot_lambda_panel_matplotlib(
+                        res_int, res_full, res_win, cfg, other_label, solve_label,
+                        cfg.lam_win_min, cfg.lam_step_min))
                 else:
-                    solve_fit = ex_solve.reindex(idx_fit).astype(float)
-                    res_int = lambda_integrated(solve_fit, dC_fit, cfg.force_zero_intercept, lambda_ext_per_s)
-                    res_full = lambda_differential(solve_fit, dC_fit, cfg.dc_min_ppm, lambda_ext_per_s)
-                    res_win = lambda_sliding(
-                        res_full["X"], res_full["Y"], res_full["t_mid"],
-                        cfg.lam_win_min, cfg.lam_step_min, cfg.lam_min_pts_win,
+                    gc1, gc2 = st.columns(2)
+                    with gc1:
+                        f1 = plot_lambda_integrated_plotly(res_int, cfg, other_label, solve_label)
+                        apply_plotly_style(f1, _style_ae)
+                        show_plotly_chart(f1)
+                    with gc2:
+                        f2 = plot_lambda_full_plotly(res_full, cfg, other_label, solve_label)
+                        apply_plotly_style(f2, _style_ae)
+                        show_plotly_chart(f2)
+                    f3 = plot_lambda_window_plotly(
+                        res_win, cfg, other_label, solve_label, cfg.lam_win_min, cfg.lam_step_min,
+                        y_range=None if _auto_y else cfg.ylims["lam_window"],
                     )
-                    _fit_ok = True
+                    apply_plotly_style(f3, _style_ae)
+                    show_plotly_chart(f3)
 
-                    st.caption(
-                        f"Window **{idx_fit[0]:%H:%M:%S} → {idx_fit[-1]:%H:%M:%S}** "
-                        f"({len(idx_fit)} points) — {end_reason}. Driving concentration: {drive_note}."
+                # --------------------------------------------------------
+                # 5) Q conversion and equilibrium check
+                # --------------------------------------------------------
+                st.markdown("---")
+                st.markdown("### 5 · Exchange flow Q and result summary")
+
+                lam_ref = res_int["lam_h"]
+                Q = lam_ref * v_solve if np.isfinite(lam_ref) else np.nan
+                tau_h = (1.0 / lam_ref) if (np.isfinite(lam_ref) and lam_ref > 0) else np.nan
+
+                s1, s2, s3 = st.columns(3)
+                s1.metric("Q (exchange flow)", f"{Q:,.1f} m³/h" if np.isfinite(Q) else "n/a",
+                          delta=f"{v_solve_note} = {v_solve:,.2f} m³", delta_color="off")
+                s2.metric("τ = 1/λ", f"{tau_h:.2f} h" if np.isfinite(tau_h) else "n/a")
+
+                _rel_h = ((pd.Timestamp(t_rel1) - pd.Timestamp(t_rel0)).total_seconds() / 3600.0
+                          if (t_rel0 is not None and t_rel1 is not None) else np.nan)
+                # Step-response bound: valid only if the source held a constant level for
+                # the whole release. A ramping source leaves the receiver further behind,
+                # so this is an upper bound on how equilibrated the receiver really is.
+                _equil = (1.0 - np.exp(-_rel_h / tau_h)) if (np.isfinite(_rel_h) and np.isfinite(tau_h) and tau_h > 0) else np.nan
+                s3.metric("Release / τ", f"{_rel_h / tau_h:.2f}" if np.isfinite(_rel_h) and np.isfinite(tau_h) else "n/a",
+                          delta=f"≤{100 * _equil:.0f}% equilibrated (step bound)" if np.isfinite(_equil) else None,
+                          delta_color="off")
+
+                st.caption(
+                    f"Q is the quantity that does not depend on which zone was solved: λ is Q "
+                    f"divided by that zone's volume, so λ_PK and λ_CAVE differ by "
+                    f"{(cfg.v_cave_effective / cfg.v_pk):.2f}× for one and the same airflow. "
+                    "Compare experiments on Q whenever the solved zone or the release "
+                    "direction differs between them."
+                )
+
+                _obs_final = np.nan
+                _io_rel = tr["io_ex"].dropna()
+                if t_rel0 is not None and t_rel1 is not None:
+                    _io_rel = _io_rel[(_io_rel.index >= pd.Timestamp(t_rel0)) & (_io_rel.index <= pd.Timestamp(t_rel1))]
+                if len(_io_rel):
+                    _obs_final = float(_io_rel.iloc[-1])
+
+                if np.isfinite(_equil) and _equil < 0.95:
+                    _msg = (
+                        f"The release lasted **{_rel_h / tau_h:.2f} τ**, so the transfer ratio in "
+                        "section 3 is a **transient** value that still depends on release duration. "
+                        "It is not a steady-state penetration factor and is only comparable across "
+                        "experiments of equal release duration."
                     )
-
-                    _sv = solve_fit.dropna()
-                    _sv_range = float(_sv.max() - _sv.min()) if len(_sv) else np.nan
-                    _dc_med = float(np.nanmedian(np.abs(dC_fit.to_numpy(dtype=float))))
-                    st.caption(
-                        f"Over this window {solve_label}'s own excess moves through "
-                        f"**{_sv_range:.1f} ppm** against a median |ΔC| of **{_dc_med:.0f} ppm**. "
-                        "λ is only identifiable when the solved zone actually responds — a zone "
-                        "that barely moves while the gradient is large is being governed by "
-                        "something other than this exchange."
-                    )
-
-                    if np.isfinite(res_int["lam_h"]) and res_int["lam_h"] <= 0:
-                        st.error(
-                            f"λ came out **non-positive ({res_int['lam_h']:.4f} 1/h)**, which is "
-                            "unphysical. The solved zone's concentration is being driven by "
-                            "something other than exchange with the other zone — most often its own "
-                            "ventilation or baseline drift. Solve the other zone instead."
+                    if np.isfinite(_obs_final):
+                        _msg += (
+                            f" The ratio actually reached **{_obs_final:.3f}** by the end of the "
+                            f"release, against a step-response bound of {_equil:.3f}. The step bound "
+                            "assumes the source held a constant level; a source that ramps up leaves "
+                            "the receiver further behind, so a sizeable gap between the two is "
+                            "expected for a continuous release rather than a sign of error."
                         )
-                    elif np.isfinite(res_int["r2"]) and res_int["r2"] < 0.5:
-                        st.warning(
-                            f"The integrated fit reaches only R² = {res_int['r2']:.3f}. The two-zone "
-                            "model is not describing this window well; treat λ as indicative only."
-                        )
+                    st.info(_msg)
 
-                    q1, q2, q3 = st.columns(3)
-                    q1.metric("λ integrated", f"{res_int['lam_h']:.4f} 1/h" if np.isfinite(res_int["lam_h"]) else "n/a",
-                              delta=f"R² = {res_int['r2']:.3f}" if np.isfinite(res_int["r2"]) else None,
-                              delta_color="off")
-                    q2.metric("λ full regression", f"{res_full['lam_h']:.4f} 1/h" if np.isfinite(res_full["lam_h"]) else "n/a",
-                              delta=f"R² = {res_full['r2']:.3f}" if np.isfinite(res_full["r2"]) else None,
-                              delta_color="off")
-                    q3.metric("λ sliding window", f"{res_win['mean_h']:.4f} 1/h" if np.isfinite(res_win["mean_h"]) else "n/a",
-                              delta=f"median = {res_win['median_h']:.3f}" if np.isfinite(res_win["median_h"]) else None,
-                              delta_color="off")
+                _dT = series_mean_in_window(deltaT_pk_minus_cave, idx_fit[0], idx_fit[-1])
+                ae_summary = {
+                    "exp_code": cfg.exp_code,
+                    "direction": direction,
+                    "release_source_zone": src_label,
+                    "release_receiver_zone": rcv_label,
+                    "solved_zone": solve_label,
+                    "driving_zone": other_label,
+                    "baseline_window_start": ae["t_base0"],
+                    "baseline_window_end": ae["t_base1"],
+                    "baseline_note": ae["base_note"],
+                    "cave_baseline_mean_ppm": ae["cave_base_mean"],
+                    "pk_baseline_mean_ppm": ae["pk_base_mean"],
+                    "cave_minus_pk_baseline_ppm": ae["cave_base_mean"] - ae["pk_base_mean"],
+                    "cave_sensors_used": int(_ic["kept"].sum()),
+                    "pk_sensors_used": int(_ip["kept"].sum()),
+                    "sigma_sensor_source_ppm": noise_src.get("sigma_sensor", np.nan),
+                    "sigma_regionmean_source_ppm": noise_src.get("sigma_mean", np.nan),
+                    "excess_threshold_ppm": ex_thresh,
+                    "transfer_ratio_mean": tr["factor"],
+                    "transfer_ratio_sd": tr["sd"],
+                    "transfer_ratio_n": tr["n"],
+                    "transfer_ratio_final": _obs_final,
+                    "ratio_window_start": pd.Timestamp(tr_t0),
+                    "ratio_window_end": pd.Timestamp(tr_t1),
+                    "ratio_window_source": tr_note,
+                    "scatter_slope": sc_slope,
+                    "scatter_intercept": sc_intercept,
+                    "scatter_r2": sc_r2,
+                    "fit_window_source": _sname,
+                    "drive_mode": drive_note,
+                    "fit_window_start": idx_fit[0],
+                    "fit_window_end": idx_fit[-1],
+                    "fit_n_points": int(len(idx_fit)),
+                    "fit_end_reason": end_reason,
+                    "dc_threshold_ppm": cfg.dc_min_ppm,
+                    "lambda_integrated_1ph": res_int["lam_h"],
+                    "lambda_integrated_r2": res_int["r2"],
+                    "lambda_full_1ph": res_full["lam_h"],
+                    "lambda_full_r2": res_full["r2"],
+                    "lambda_window_mean_1ph": res_win["mean_h"],
+                    "lambda_window_median_1ph": res_win["median_h"],
+                    "lambda_window_min": cfg.lam_win_min,
+                    "lambda_step_min": cfg.lam_step_min,
+                    "lambda_ext_applied_1ph": cfg.lambda_ext if lambda_ext_per_s else 0.0,
+                    "V_receiver_m3": v_solve,
+                    "V_receiver_basis": v_solve_note,
+                    "Q_m3ph": Q,
+                    "tau_h": tau_h,
+                    "release_over_tau": (_rel_h / tau_h) if (np.isfinite(_rel_h) and np.isfinite(tau_h)) else np.nan,
+                    "equilibrated_fraction_step_bound": _equil,
+                    "deltaT_pk_minus_cave_mean": _dT,
+                }
+                ae_summary_df = build_summary_df(ae_summary)
+                st.dataframe(ae_summary_df, use_container_width=True, hide_index=True)
 
-                    st.caption(
-                        "The integrated method usually shows the higher R² because integration "
-                        "smooths the noise; the differential methods reveal whether λ drifts during "
-                        "the window. They are cross-checks, not alternatives."
-                    )
+                ae_export = {
+                    "summary": ae_summary,
+                    "summary_df": ae_summary_df,
+                    "res_int": res_int,
+                    "res_full": res_full,
+                    "res_win": res_win,
+                    "tr": tr,
+                    "tr_window": (tr_t0, tr_t1),
+                    "df_sc": df_sc,
+                    "sc": (sc_slope, sc_intercept, sc_r2),
+                    "labels": (src_label, rcv_label),
+                    "lam_labels": (other_label, solve_label),
+                    "ex_thresh": ex_thresh,
+                }
 
-                    if go is None:
-                        show_matplotlib_fig(plot_lambda_panel_matplotlib(
-                            res_int, res_full, res_win, cfg, other_label, solve_label,
-                            cfg.lam_win_min, cfg.lam_step_min))
-                    else:
-                        gc1, gc2 = st.columns(2)
-                        with gc1:
-                            f1 = plot_lambda_integrated_plotly(res_int, cfg, other_label, solve_label)
-                            apply_plotly_style(f1, _style_ae)
-                            show_plotly_chart(f1)
-                        with gc2:
-                            f2 = plot_lambda_full_plotly(res_full, cfg, other_label, solve_label)
-                            apply_plotly_style(f2, _style_ae)
-                            show_plotly_chart(f2)
-                        f3 = plot_lambda_window_plotly(
-                            res_win, cfg, other_label, solve_label, cfg.lam_win_min, cfg.lam_step_min,
-                            y_range=None if _auto_y else cfg.ylims["lam_window"],
-                        )
-                        apply_plotly_style(f3, _style_ae)
-                        show_plotly_chart(f3)
-
-                    # --------------------------------------------------------
-                    # 5) Q conversion and equilibrium check
-                    # --------------------------------------------------------
-                    st.markdown("---")
-                    st.markdown("### 5 · Exchange flow Q and result summary")
-
-                    lam_ref = res_int["lam_h"]
-                    Q = lam_ref * v_solve if np.isfinite(lam_ref) else np.nan
-                    tau_h = (1.0 / lam_ref) if (np.isfinite(lam_ref) and lam_ref > 0) else np.nan
-
-                    s1, s2, s3 = st.columns(3)
-                    s1.metric("Q (exchange flow)", f"{Q:,.1f} m³/h" if np.isfinite(Q) else "n/a",
-                              delta=f"{v_solve_note} = {v_solve:,.2f} m³", delta_color="off")
-                    s2.metric("τ = 1/λ", f"{tau_h:.2f} h" if np.isfinite(tau_h) else "n/a")
-
-                    _rel_h = ((pd.Timestamp(t_rel1) - pd.Timestamp(t_rel0)).total_seconds() / 3600.0
-                              if (t_rel0 is not None and t_rel1 is not None) else np.nan)
-                    # Step-response bound: valid only if the source held a constant level for
-                    # the whole release. A ramping source leaves the receiver further behind,
-                    # so this is an upper bound on how equilibrated the receiver really is.
-                    _equil = (1.0 - np.exp(-_rel_h / tau_h)) if (np.isfinite(_rel_h) and np.isfinite(tau_h) and tau_h > 0) else np.nan
-                    s3.metric("Release / τ", f"{_rel_h / tau_h:.2f}" if np.isfinite(_rel_h) and np.isfinite(tau_h) else "n/a",
-                              delta=f"≤{100 * _equil:.0f}% equilibrated (step bound)" if np.isfinite(_equil) else None,
-                              delta_color="off")
-
-                    st.caption(
-                        f"Q is the quantity that does not depend on which zone was solved: λ is Q "
-                        f"divided by that zone's volume, so λ_PK and λ_CAVE differ by "
-                        f"{(cfg.v_cave_effective / cfg.v_pk):.2f}× for one and the same airflow. "
-                        "Compare experiments on Q whenever the solved zone or the release "
-                        "direction differs between them."
-                    )
-
-                    _obs_final = np.nan
-                    _io_rel = tr["io_ex"].dropna()
-                    if t_rel0 is not None and t_rel1 is not None:
-                        _io_rel = _io_rel[(_io_rel.index >= pd.Timestamp(t_rel0)) & (_io_rel.index <= pd.Timestamp(t_rel1))]
-                    if len(_io_rel):
-                        _obs_final = float(_io_rel.iloc[-1])
-
-                    if np.isfinite(_equil) and _equil < 0.95:
-                        _msg = (
-                            f"The release lasted **{_rel_h / tau_h:.2f} τ**, so the transfer ratio in "
-                            "section 3 is a **transient** value that still depends on release duration. "
-                            "It is not a steady-state penetration factor and is only comparable across "
-                            "experiments of equal release duration."
-                        )
-                        if np.isfinite(_obs_final):
-                            _msg += (
-                                f" The ratio actually reached **{_obs_final:.3f}** by the end of the "
-                                f"release, against a step-response bound of {_equil:.3f}. The step bound "
-                                "assumes the source held a constant level; a source that ramps up leaves "
-                                "the receiver further behind, so a sizeable gap between the two is "
-                                "expected for a continuous release rather than a sign of error."
-                            )
-                        st.info(_msg)
-
-                    _dT = series_mean_in_window(deltaT_pk_minus_cave, idx_fit[0], idx_fit[-1])
-                    ae_summary = {
-                        "exp_code": cfg.exp_code,
-                        "direction": direction,
-                        "release_source_zone": src_label,
-                        "release_receiver_zone": rcv_label,
-                        "solved_zone": solve_label,
-                        "driving_zone": other_label,
-                        "baseline_window_start": ae["t_base0"],
-                        "baseline_window_end": ae["t_base1"],
-                        "baseline_note": ae["base_note"],
-                        "cave_baseline_mean_ppm": ae["cave_base_mean"],
-                        "pk_baseline_mean_ppm": ae["pk_base_mean"],
-                        "cave_minus_pk_baseline_ppm": ae["cave_base_mean"] - ae["pk_base_mean"],
-                        "cave_sensors_used": int(_ic["kept"].sum()),
-                        "pk_sensors_used": int(_ip["kept"].sum()),
-                        "sigma_sensor_source_ppm": noise_src.get("sigma_sensor", np.nan),
-                        "sigma_regionmean_source_ppm": noise_src.get("sigma_mean", np.nan),
-                        "excess_threshold_ppm": ex_thresh,
-                        "transfer_ratio_mean": tr["factor"],
-                        "transfer_ratio_sd": tr["sd"],
-                        "transfer_ratio_n": tr["n"],
-                        "transfer_ratio_final": _obs_final,
-                        "scatter_slope": sc_slope,
-                        "scatter_intercept": sc_intercept,
-                        "scatter_r2": sc_r2,
-                        "fit_stage": _sname,
-                        "drive_mode": drive_note,
-                        "fit_window_start": idx_fit[0],
-                        "fit_window_end": idx_fit[-1],
-                        "fit_n_points": int(len(idx_fit)),
-                        "fit_end_reason": end_reason,
-                        "dc_threshold_ppm": cfg.dc_min_ppm,
-                        "lambda_integrated_1ph": res_int["lam_h"],
-                        "lambda_integrated_r2": res_int["r2"],
-                        "lambda_full_1ph": res_full["lam_h"],
-                        "lambda_full_r2": res_full["r2"],
-                        "lambda_window_mean_1ph": res_win["mean_h"],
-                        "lambda_window_median_1ph": res_win["median_h"],
-                        "lambda_window_min": cfg.lam_win_min,
-                        "lambda_step_min": cfg.lam_step_min,
-                        "lambda_ext_applied_1ph": cfg.lambda_ext if lambda_ext_per_s else 0.0,
-                        "V_receiver_m3": v_solve,
-                        "V_receiver_basis": v_solve_note,
-                        "Q_m3ph": Q,
-                        "tau_h": tau_h,
-                        "release_over_tau": (_rel_h / tau_h) if (np.isfinite(_rel_h) and np.isfinite(tau_h)) else np.nan,
-                        "equilibrated_fraction_step_bound": _equil,
-                        "deltaT_pk_minus_cave_mean": _dT,
-                    }
-                    ae_summary_df = build_summary_df(ae_summary)
-                    st.dataframe(ae_summary_df, use_container_width=True, hide_index=True)
-
-                    ae_export = {
-                        "summary": ae_summary,
-                        "summary_df": ae_summary_df,
-                        "res_int": res_int,
-                        "res_full": res_full,
-                        "res_win": res_win,
-                        "tr": tr,
-                        "df_sc": df_sc,
-                        "sc": (sc_slope, sc_intercept, sc_r2),
-                        "labels": (src_label, rcv_label),
-                        "lam_labels": (other_label, solve_label),
-                        "ex_thresh": ex_thresh,
-                    }
-
-            if not _fit_ok:
-                st.caption("λ results appear here once a stage with a usable fitting window is selected.")
+        if not _fit_ok:
+            st.caption(
+                "λ results appear here once the window above contains a usable stretch. "
+                "Switch the window control to **Manual** if the logged stage boundaries do not "
+                "match where the exchange actually starts."
+            )
 
 
 with tab7:
@@ -5761,10 +5857,11 @@ with tab8:
         )
 
         _buf_io = io.BytesIO()
+        _w0, _w1 = ae_export["tr_window"]
         _fig_io = plot_io_ratio(
-            ae_export["tr"]["io_ex"], ae_export["tr"]["factor"], t_rel0, t_rel1,
+            ae_export["tr"]["io_ex"], ae_export["tr"]["factor"], _w0, _w1,
             ae["t_base0"], ae["t_base1"], ae_export["ex_thresh"], cfg,
-            src_label=_ae_src, rcv_label=_ae_rcv,
+            src_label=_ae_src, rcv_label=_ae_rcv, window_label="Analysis window",
         )
         _fig_io.savefig(_buf_io, format="png", dpi=200, bbox_inches="tight")
         _buf_io.seek(0)
