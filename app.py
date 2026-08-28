@@ -7172,49 +7172,49 @@ with tab8:
                     )
                     st.markdown("---")
 
-        # ---- Air exchange (PK <-> CAVE) ----------------------------------
-        if ae_export is not None:
-            _ae_other, _ae_solve = ae_export["lam_labels"]
-            _ae_src, _ae_rcv = ae_export["labels"]
-            _w0, _w1 = ae_export["tr_window"]
+            # ---- Air exchange (PK <-> CAVE) ----------------------------------
+            if ae_export is not None:
+                _ae_other, _ae_solve = ae_export["lam_labels"]
+                _ae_src, _ae_rcv = ae_export["labels"]
+                _w0, _w1 = ae_export["tr_window"]
 
-            _download_row(
-                plot_io_ratio(
-                    ae_export["tr"]["io_ex"], ae_export["tr"]["factor"], _w0, _w1,
-                    ae["t_base0"], ae["t_base1"], ae_export["ex_thresh"], cfg,
-                    src_label=_ae_src, rcv_label=_ae_rcv,
-                    window_label="Analysis window", export_mode=True,
-                ),
-                "transfer_ratio", "transfer ratio",
-            )
-            st.markdown("---")
+                _download_row(
+                    plot_io_ratio(
+                        ae_export["tr"]["io_ex"], ae_export["tr"]["factor"], _w0, _w1,
+                        ae["t_base0"], ae["t_base1"], ae_export["ex_thresh"], cfg,
+                        src_label=_ae_src, rcv_label=_ae_rcv,
+                        window_label="Analysis window", export_mode=True,
+                    ),
+                    "transfer_ratio", "transfer ratio",
+                )
+                st.markdown("---")
 
-            _sl, _ic_, _r2_ = ae_export["sc"]
-            _download_row(
-                plot_scatter(ae_export["df_sc"], _sl, _ic_, _r2_, cfg,
-                             src_label=_ae_src, rcv_label=_ae_rcv, export_mode=True),
-                "excess_scatter", "excess scatter",
-            )
-            st.markdown("---")
+                _sl, _ic_, _r2_ = ae_export["sc"]
+                _download_row(
+                    plot_scatter(ae_export["df_sc"], _sl, _ic_, _r2_, cfg,
+                                 src_label=_ae_src, rcv_label=_ae_rcv, export_mode=True),
+                    "excess_scatter", "excess scatter",
+                )
+                st.markdown("---")
 
-            _download_row(
-                plot_lambda_integrated_export(ae_export["res_int"], cfg, _ae_other, _ae_solve),
-                "lambda_integrated", f"λ integrated ({_ae_solve})",
-            )
-            st.markdown("---")
+                _download_row(
+                    plot_lambda_integrated_export(ae_export["res_int"], cfg, _ae_other, _ae_solve),
+                    "lambda_integrated", f"λ integrated ({_ae_solve})",
+                )
+                st.markdown("---")
 
-            _download_row(
-                plot_lambda_regression_export(ae_export["res_full"], cfg, _ae_other, _ae_solve),
-                "lambda_regression", f"λ full regression ({_ae_solve})",
-            )
-            st.markdown("---")
+                _download_row(
+                    plot_lambda_regression_export(ae_export["res_full"], cfg, _ae_other, _ae_solve),
+                    "lambda_regression", f"λ full regression ({_ae_solve})",
+                )
+                st.markdown("---")
 
-            _download_row(
-                plot_lambda_window_export(ae_export["res_win"], cfg, _ae_other, _ae_solve,
-                                          cfg.lam_win_min, cfg.lam_step_min),
-                "lambda_sliding_window", f"λ sliding window ({_ae_solve})",
-            )
-            st.markdown("---")
+                _download_row(
+                    plot_lambda_window_export(ae_export["res_win"], cfg, _ae_other, _ae_solve,
+                                              cfg.lam_win_min, cfg.lam_step_min),
+                    "lambda_sliding_window", f"λ sliding window ({_ae_solve})",
+                )
+                st.markdown("---")
 
         # Now that every figure above has been built and its PNG/SVG bytes
         # collected, fill in the placeholder reserved at the top of this
