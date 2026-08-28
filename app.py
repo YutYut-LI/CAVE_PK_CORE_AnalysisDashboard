@@ -4,11 +4,14 @@
 
 from __future__ import annotations
 
+import colorsys
+from cycler import cycler
 import html
-import hashlib
 import io
+import os
 import re
 import traceback
+import zipfile
 from dataclasses import dataclass
 from typing import Optional, List, Tuple, Dict, Any
 
@@ -16,6 +19,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 import datetime as _dt
+import matplotlib as mpl
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 from matplotlib.patches import Patch
@@ -30,6 +34,27 @@ except Exception:  # pragma: no cover
     make_subplots = None  # type: ignore
 
 # Plotly default qualitative palette (matches unset trace colours in charts).
+# Okabe-Ito qualitative palette — colour-blind-safe, the muted-but-distinct
+# categorical scheme widely recommended (Nature Methods "Points of view")
+# and used across many journal figures, in place of Matplotlib's default
+# high-saturation tab10 cycle. Used for export figures only.
+_JOURNAL_PALETTE = ["#0072B2", "#D55E00", "#009E73", "#E69F00", "#56B4E9", "#CC79A7", "#F0E442", "#000000"]
+
+
+def _journal_colors(n: int) -> List[str]:
+    """n colours in the journal palette; extends past 8 categories with
+    evenly-spaced hues at a fixed muted saturation/value, so added colours
+    read as the same family instead of tab20's jarring vivid/pastel pairs."""
+    if n <= len(_JOURNAL_PALETTE):
+        return _JOURNAL_PALETTE[:n]
+    extra_n = n - len(_JOURNAL_PALETTE)
+    extra = [
+        mpl.colors.to_hex(colorsys.hsv_to_rgb(i / extra_n, 0.55, 0.75))
+        for i in range(extra_n)
+    ]
+    return list(_JOURNAL_PALETTE) + extra
+
+
 _PLOTLY_SERIES_COLORS = (
     list(pc.qualitative.Plotly)
     if pc is not None
@@ -76,6 +101,16 @@ PLOTLY_CHART_CONFIG = {
     "responsive": True,
     "displayModeBar": True,
     "displaylogo": False,
+    # Fix the toolbar camera-icon "download as PNG" to a constant size/scale so
+    # the exported image no longer depends on how wide the browser window
+    # happens to be when you click it (fonts/lines are re-laid-out to fit
+    # this size, not scaled from the on-screen render).
+    "toImageButtonOptions": {
+        "format": "png",
+        "width": 1600,
+        "height": 900,
+        "scale": 2,
+    },
 }
 
 
@@ -168,29 +203,148 @@ def default_ylims():
     }
 
 
+def _auto_ylim(*series_list, pad_frac: float = 0.08) -> Optional[Tuple[float, float]]:
+    """Data-driven y-limits (min/max across all given series, plus padding).
+
+    Used for export-figure panels whose value range is experiment-specific
+    (CO2/temperature levels, deltas) — as opposed to panels with a natural
+    fixed domain (ratios like Mixing Index/R2/Coverage/RH/CV), which keep
+    using the fixed defaults in default_ylims().
+    """
+    chunks = []
+    for s in series_list:
+        if s is None:
+            continue
+        arr = np.asarray(s, dtype=float).ravel()
+        arr = arr[np.isfinite(arr)]
+        if arr.size:
+            chunks.append(arr)
+    if not chunks:
+        return None
+    allv = np.concatenate(chunks)
+    lo, hi = float(allv.min()), float(allv.max())
+    if lo == hi:
+        pad = max(abs(lo) * pad_frac, 1.0)
+    else:
+        pad = (hi - lo) * pad_frac
+    return (lo - pad, hi + pad)
+
+
+def _data_date_prefix(df: Optional[pd.DataFrame]) -> str:
+    """YYYYMMDD from the data's own earliest timestamp, for export filenames."""
+    try:
+        t0 = pd.Timestamp(df["time"].min())
+        if pd.notna(t0):
+            return t0.strftime("%Y%m%d")
+    except Exception:
+        pass
+    return "export"
+
+
+def _export_figlegend(fig, handles, labels, *, where: str = "bottom", fontsize: int = 9,
+                       anchor_ax=None) -> None:
+    """Figure-level legend anchored just outside one axes' own top/bottom
+    edge — never wedged between subplots regardless of how many panels
+    there are, and wrapped into columns so it's never truncated regardless
+    of series count. Anchoring in that axes' own coordinate space (rather
+    than the whole figure's 0..1) means the gap is a small constant offset
+    from the real edge, not compounded with tight_layout's own margins —
+    which is what left a big blank band before. Use one call per figure
+    when every panel shares the same series (e.g. CAVE/PK/stage colour
+    coding repeated across all panels); use two calls — one 'top', one
+    'bottom', each anchored to its own axes — when two panels show
+    genuinely different series and a single shared legend would be
+    ambiguous."""
+    n = max(1, len(labels))
+    axes_list = anchor_ax if anchor_ax is not None else fig.axes[0]
+    if not isinstance(axes_list, (list, tuple)):
+        axes_list = [axes_list]
+    # Read the REAL position after layout (call tight_layout/etc. before
+    # this). When multiple axes share the same row (e.g. both columns of a
+    # 5x2 grid), take the union of their boxes — their tick-label widths can
+    # differ enough that one column's "Time" label sits lower than the
+    # other's, and anchoring off just one column would clip into it.
+    fig.canvas.draw()
+    boxes = [a.get_position() for a in axes_list]
+    y0 = min(b.y0 for b in boxes)
+    y1 = max(b.y1 for b in boxes)
+    x0 = min(b.x0 for b in boxes)
+    x1 = max(b.x1 for b in boxes)
+
+    class _Pos:
+        pass
+
+    pos = _Pos()
+    pos.y0, pos.y1, pos.x0, pos.x1 = y0, y1, x0, x1
+    pos.width = x1 - x0
+    fig_h = max(float(fig.get_figheight()), 1.0)
+    fig_w = max(float(fig.get_figwidth()), 1.0)
+    # Cap columns so the legend's estimated width never exceeds the anchor
+    # axes' own width — otherwise a legend with few, short entries (e.g. 5
+    # walls + 3 stages) renders wider than the plot it sits above/below,
+    # which looks unbalanced even though nothing gets cut off.
+    handlelen, handlepad, colspace = 1.8, 0.6, 1.4
+    fs_pt = max(5, min(24, int(fontsize)))
+    avg_chars = sum(len(str(l)) for l in labels) / n
+    entry_w_in = ((handlelen + handlepad + colspace) + avg_chars * 0.58) * fs_pt / 72.0
+    avail_w_in = max(pos.width * fig_w, entry_w_in)
+    ncol = max(1, min(n, 6, int(avail_w_in / max(entry_w_in, 0.01))))
+    n_rows = -(-n // ncol)  # ceil
+    if where == "top":
+        gap_in = 0.10 + 0.16 * (n_rows - 1)
+        loc, anchor_y = "lower center", pos.y1 + gap_in / fig_h
+    else:
+        # 'bottom' has to clear that axes' rotated tick labels + the bold
+        # "Time" x-label sitting just below it. Measure their real rendered
+        # extent instead of guessing a fixed inch offset — a flat constant
+        # drifted out of sync once export mode switched to larger fonts
+        # (taller tick/axis labels) and started overlapping the legend.
+        renderer = fig.canvas.get_renderer()
+        content_bottoms = [pos.y0]
+        for a in axes_list:
+            xlabel_bbox = a.xaxis.label.get_window_extent(renderer)
+            content_bottoms.append(xlabel_bbox.transformed(fig.transFigure.inverted()).y0)
+            for tl in a.get_xticklabels():
+                tb = tl.get_window_extent(renderer)
+                if tb.width > 0 or tb.height > 0:
+                    content_bottoms.append(tb.transformed(fig.transFigure.inverted()).y0)
+        content_bottom = min(content_bottoms)
+        buffer_in = 0.14 + 0.16 * (n_rows - 1)
+        loc, anchor_y = "upper center", content_bottom - buffer_in / fig_h
+    fig.legend(
+        handles, labels, loc=loc, bbox_to_anchor=(0.5, anchor_y), bbox_transform=fig.transFigure,
+        ncol=ncol, frameon=True, fontsize=fs_pt,
+        columnspacing=colspace, handletextpad=handlepad, handlelength=handlelen, labelspacing=0.5,
+        edgecolor="0.75", facecolor="white",
+    )
+
+
+def _publication_rc_dict(base_pt: float) -> Dict[str, Any]:
+    b = float(base_pt)
+    return {
+        "font.size": b,
+        "axes.labelsize": b,
+        "axes.titlesize": b + 1,
+        "xtick.labelsize": max(b - 1, 8),
+        "ytick.labelsize": max(b - 1, 8),
+        "legend.fontsize": max(b - 2, 7),
+        "figure.titlesize": b + 2,
+        "axes.prop_cycle": cycler(color=_JOURNAL_PALETTE),
+        "axes.linewidth": 0.9,
+        "axes.edgecolor": "0.25",
+        "axes.labelcolor": "black",
+        "xtick.color": "0.25",
+        "ytick.color": "0.25",
+        "text.color": "black",
+        "legend.frameon": True,
+        "legend.facecolor": "white",
+        "legend.edgecolor": "0.75",
+    }
+
+
 def apply_matplotlib_publication_rc(base_pt: float) -> None:
     """Set matplotlib rcParams for dashboard + export (publication-friendly)."""
-    b = float(base_pt)
-    plt.rcParams.update(
-        {
-            "font.size": b,
-            "axes.labelsize": b,
-            "axes.titlesize": b + 1,
-            "xtick.labelsize": max(b - 1, 8),
-            "ytick.labelsize": max(b - 1, 8),
-            "legend.fontsize": max(b - 2, 7),
-            "figure.titlesize": b + 2,
-            "axes.linewidth": 1.0,
-            "axes.edgecolor": "black",
-            "axes.labelcolor": "black",
-            "xtick.color": "black",
-            "ytick.color": "black",
-            "text.color": "black",
-            "legend.frameon": True,
-            "legend.facecolor": "white",
-            "legend.edgecolor": "black",
-        }
-    )
+    plt.rcParams.update(_publication_rc_dict(base_pt))
 
 
 # =========================================================
@@ -1049,14 +1203,19 @@ def sensor_value_timeseries(
     align_to: str,
     value_col: str,
     catalog: Optional[pd.DataFrame] = None,
+    label_fn=None,
 ) -> pd.DataFrame:
-    """Per-sensor mean by time bin (columns = readable sensor labels)."""
+    """Per-sensor mean by time bin (columns = readable sensor labels).
+    label_fn(sensor_number, wall, z_median) overrides the default "S### (wall,
+    z=X.XXm)" label — e.g. the PK per-room view drops the wall since it's
+    already implied by which room's panel the sensor is plotted on."""
     if df_region is None or len(df_region) == 0 or not sensor_numbers or value_col not in df_region.columns:
         return pd.DataFrame()
 
     cat = catalog if catalog is not None else sensor_catalog(df_region)
+    _label = label_fn if label_fn is not None else _sensor_series_label
     label_by_id = {
-        int(r["sensor_number"]): _sensor_series_label(
+        int(r["sensor_number"]): _label(
             int(r["sensor_number"]), str(r["wall"]), float(r["z_median"]) if pd.notna(r["z_median"]) else np.nan
         )
         for _, r in cat.iterrows()
@@ -1082,8 +1241,374 @@ def sensor_co2_timeseries(
     sensor_numbers: List[int],
     align_to: str,
     catalog: Optional[pd.DataFrame] = None,
+    label_fn=None,
 ) -> pd.DataFrame:
-    return sensor_value_timeseries(df_region, sensor_numbers, align_to, "co2", catalog=catalog)
+    return sensor_value_timeseries(df_region, sensor_numbers, align_to, "co2", catalog=catalog, label_fn=label_fn)
+
+
+# =========================================================
+# PK — per-room floor-plan view
+# =========================================================
+# Room adjacency matches the reference poster exactly: the floor plan
+# shares its column with FF03 (above) and FF05 (below) on FF, and with
+# GFS (below) on GF — same as those rooms' real physical position next to
+# it — rather than being pulled into its own column. That column is wider
+# than the room-only columns (so the floor plan itself can be big, close
+# to its own true aspect ratio, without distorting it), but FF03/FF05/GFS
+# are re-centered back down to the same width as every other room in the
+# export "template" composite (see the nested subgridspec in
+# plot_pk_floorplan_export) — otherwise sharing a wider column would make
+# them wider than the other 6 rooms too. Row alignment between columns is
+# not attempted (by request — the floor-plan:room-chart size ratio in the
+# reference matters more than every column bottoming out at the same row).
+PK_FLOORPLAN_LAYOUT = {
+    "FF": [
+        {"width": 1.0, "items": ["FF01", "__GAP__", "FF02", "__GAP__", "FF04"]},
+        {"width": 1.4663, "items": ["FF03", "__GAP__", "__FLOORPLAN__", "__GAP__", "FF05"]},
+        {"width": 1.0, "items": ["FF06", "__GAP__", "FFC", "__GAP__", "FFS"]},
+    ],
+    "GF": [
+        {"width": 1.0, "items": ["GF01"]},
+        {"width": 1.381, "items": ["__FLOORPLAN__", "__GAP__", "GFS"]},
+    ],
+}
+PK_FLOORPLAN_IMAGES = {"FF": "PK_FirstFloorPlan.png", "GF": "PK_GroundFloorPlan.png"}
+# Every room chart is exactly PK_FLOORPLAN_ROOM_UNIT grid rows tall,
+# regardless of column — same height for every room, always. The floor
+# plan gets FP_SPAN rows instead. Both floors' base numbers are measured
+# directly from the reference file's own slides — FF from slide 15
+# (floor plan 5.591x2.863in vs. every room chart 3.813x1.985in, ratios
+# 1.466 wide/1.442 tall) and GF from its paired slide 16 (floor plan
+# 5.981x3.629in vs. every room chart 5.413x2.818in, ratios 1.105 wide/
+# 1.288 tall) — not a guess either way. GF01/GFE/GFS are the same size
+# as each other there too; GFE itself is left out of PK_FLOORPLAN_LAYOUT
+# on purpose (classify_regions() puts it in CAVE, not PK — see
+# _pk_room_group's docstring), so only the floor-plan:room size ratio
+# from that slide carries over, not its exact room list. GF's measured
+# ratio read as noticeably smaller than FF's once actually rendered, so
+# by request it's scaled up 1.25x from that measured baseline (1.105->
+# 1.381 width, 129->161 span) rather than left at the literal slide value.
+PK_FLOORPLAN_ROOM_WIDTH = 1.0
+PK_FLOORPLAN_ROOM_UNIT = 100
+# Real blank space (in the same units) between two rooms stacked in the
+# same column — see the "hspace=0.0" note above for why this is a real
+# grid span rather than GridSpec's hspace.
+PK_FLOORPLAN_GAP_SPAN = 28
+PK_FLOORPLAN_FP_SPAN = {"FF": 144, "GF": 161}
+# GridSpec's column-to-column gap (a fraction of average column width).
+# GF's columns hold plain, un-nested cells on both sides (GF01 | floor
+# plan), so this *is* the real visible gap between them — measured at
+# 2.844in with the old shared 0.30 versus the 0.797in vertical gap
+# between the floor plan and GFS below it (the "__GAP__" spans, tuned
+# separately), so it's cut down here to make the two roughly match. FF
+# keeps the old 0.30: its side-column rooms sit right up against a
+# *nested* nested cell (FF03/FF05's own margin already adds real blank
+# space), so the same wspace produces a different-looking gap there.
+PK_FLOORPLAN_WSPACE = {"FF": 0.30, "GF": -0.074}
+
+
+def _pk_room_group(wall: str) -> str:
+    """Collapse duct/perimeter sensor tags into the parent room box drawn on
+    the floor plan (e.g. FF01_Supply -> FF01) rather than the finer-grained
+    wall/zone tags used for the Zone CO2/Temp tab. GFE/FFE never reach here
+    at all — classify_regions() already routes them to CAVE, not PK (they're
+    CAVE's exterior/perimeter sensors despite the "GF"/"FF" naming), so this
+    tab (which only ever looks at df_pk) correctly never shows them. Still
+    normalized to upper case so a raw tag written as e.g. "ff01_supply"
+    matches the (upper-case) room names in PK_FLOORPLAN_LAYOUT."""
+    w = str(wall).strip().upper()
+    for suffix in ("_SUPPLY", "_EXTRACT"):
+        if w.endswith(suffix):
+            return w[: -len(suffix)]
+    return w
+
+
+def _room_sensor_label(sensor_number: int, wall: str, z_median: float = np.nan) -> str:
+    """Legend label for the PK per-room view: just the sensor + height, no
+    wall repeated (the room is already implied by which panel it's on) —
+    matches the reference poster's "S251 (z=6.00 m)" style."""
+    z_part = f"z={z_median:.2f} m" if np.isfinite(z_median) else "z=?"
+    return f"S{int(sensor_number)} ({z_part})"
+
+
+# Bump whenever plot_room_sensors_matplotlib's drawing logic changes.
+# plot_pk_floorplan_export is @st.cache_resource'd, but Streamlit's cache
+# only rehashes *that* function's own bytecode on an edit — it doesn't
+# recurse into plot_room_sensors_matplotlib (a plain module-level function
+# it calls, not a closure), so an edit here alone would keep serving a
+# stale cached composite. Passing this constant into plot_pk_floorplan_export
+# as a real (hashed) argument forces the cache to invalidate whenever it's
+# bumped, regardless of that limitation.
+PK_ROOM_PLOT_VERSION = 2
+
+
+def plot_room_sensors_matplotlib(
+    ts_df: pd.DataFrame,
+    room_label: str,
+    stage_defs,
+    plot_start,
+    plot_end,
+    *,
+    y_range: Optional[Tuple[float, float]] = None,
+    line_width: float = 1.3,
+    legend_fontsize: int = 8,
+    figsize: Tuple[float, float] = (5.2, 3.6),
+    ax: Optional[Any] = None,
+):
+    """One small-multiple panel: every individual sensor in a single PK room,
+    CO2 vs time — matplotlib (not Plotly) so the legend can wrap into a
+    compact multi-column grid like the reference poster, scaling the column
+    count with how many sensors are in the room.
+
+    Pass an existing `ax` to draw into that axes instead of creating a new
+    standalone figure — this is how the export "template" composite (whole
+    floor, one image) reuses the exact same per-room drawing/legend logic
+    as the on-screen single-room panels."""
+    standalone = ax is None
+    if standalone:
+        fig, ax = plt.subplots(figsize=figsize)
+    else:
+        fig = ax.get_figure()
+    n = max(1, len(ts_df.columns))
+    # Real per-bin dropouts (a sensor occasionally missing a reading) leave
+    # scattered single-point NaNs in this data — plotted as-is, matplotlib
+    # breaks the line at every one of them, which for a handful of scattered
+    # gaps reads as a dashed/broken line rather than a clean solid one.
+    # Linear-interpolating those small gaps (not the underlying data table,
+    # only this plotting copy) draws one continuous line without pretending
+    # a real, longer outage didn't happen.
+    ts_plot = ts_df.interpolate(method="linear", limit_direction="both")
+    for col in ts_plot.columns:
+        ax.plot(ts_plot.index, ts_plot[col].values, linewidth=line_width, label=col)
+
+    stage_patches: list = []
+    if stage_defs:
+        add_stage_shading(ax, stage_defs, stage_patches)
+
+    ax.set_title(f"{room_label} — CO₂ concentration over time", fontsize=10, fontweight="bold")
+    ax.set_ylabel("CO₂ (ppm)", fontsize=9, fontweight="bold")
+    ax.set_xlabel("Time", fontsize=9, fontweight="bold")
+    ax.grid(True, color="0.85", linewidth=0.5)
+    ax.set_axisbelow(True)
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
+    plt.setp(ax.get_xticklabels(), rotation=45, fontsize=7)
+    plt.setp(ax.get_yticklabels(), fontsize=7)
+
+    if plot_start is not None and plot_end is not None:
+        ax.set_xlim(plot_start, plot_end)
+    if y_range is not None:
+        ax.set_ylim(*y_range)
+    else:
+        auto = _auto_ylim(*[ts_df[c] for c in ts_df.columns])
+        if auto:
+            ax.set_ylim(*auto)
+
+    # Scale legend columns with sensor count so a 20+-sensor room (e.g. GF01)
+    # stays a compact block instead of one very tall single column — matching
+    # the reference poster's layout, which does the same.
+    ncol = max(1, min(4, -(-n // 6)))
+    # fig.tight_layout() (not the pyplot-level plt.tight_layout()) so this
+    # always targets this specific figure, regardless of matplotlib's
+    # notion of the "current" figure — matters once this is called
+    # repeatedly for several rooms sharing one composite figure.
+    fig.tight_layout()
+    if n <= 8:
+        # Small enough to tuck into an empty corner of the plot itself
+        # (matplotlib picks the least-busy spot) without covering data.
+        ax.legend(fontsize=legend_fontsize, ncol=ncol, loc="best", frameon=True, framealpha=0.9)
+    else:
+        # Too many entries to fit inside the axes without covering data —
+        # drop it below instead, like the reference poster's GF01 panel.
+        # Measure the real rendered bottom edge of the x-tick labels/xlabel
+        # (their height depends on font size and rotation, not on the
+        # axes' own size) and anchor a small fixed buffer below THAT,
+        # rather than guessing an axes-fraction offset — a flat fraction
+        # constant left short single-row axes (e.g. FF04/FFS here) with too
+        # little real clearance while over-spacing taller ones (e.g. GF01,
+        # which spans two grid rows in the export "template" composite).
+        # st.pyplot()/savefig(bbox_inches="tight") expands the saved image
+        # to include it, so it never gets clipped.
+        fig.canvas.draw()
+        renderer = fig.canvas.get_renderer()
+        content_bottoms_px = [ax.xaxis.label.get_window_extent(renderer).y0]
+        for tl in ax.get_xticklabels():
+            tb = tl.get_window_extent(renderer)
+            if tb.width > 0 or tb.height > 0:
+                content_bottoms_px.append(tb.y0)
+        buffer_px = 0.12 * fig.dpi
+        target_top_px = min(content_bottoms_px) - buffer_px
+        target_axes_frac = ax.transAxes.inverted().transform((0.0, target_top_px))[1]
+        ax.legend(
+            fontsize=legend_fontsize, ncol=ncol, loc="upper center",
+            bbox_to_anchor=(0.5, target_axes_frac),
+            frameon=True, framealpha=0.9,
+        )
+    return fig if standalone else ax
+
+
+@st.cache_resource(show_spinner=False)
+def plot_pk_floorplan_export(
+    floor_key: str,
+    pk_cat: pd.DataFrame,
+    df_pk: pd.DataFrame,
+    align_to: str,
+    stage_defs,
+    plot_start,
+    plot_end,
+    fp_img_path: Optional[str],
+    *,
+    y_range: Optional[Tuple[float, float]] = None,
+    cache_version: int = PK_ROOM_PLOT_VERSION,
+):
+    """One fixed, report-ready composite for a whole floor: every room's
+    sensor-level CO2 panel plus the real floor plan, laid out exactly like
+    PK_FLOORPLAN_LAYOUT — the downloadable "template" version of the
+    on-screen PK Rooms tab, all as a single PNG/SVG."""
+    columns = PK_FLOORPLAN_LAYOUT[floor_key]
+    col_widths = [c["width"] for c in columns]
+    room_unit = PK_FLOORPLAN_ROOM_UNIT
+    fp_span = PK_FLOORPLAN_FP_SPAN.get(floor_key, 2 * room_unit)
+
+    def _item_span(it: str) -> int:
+        if it == "__FLOORPLAN__":
+            return fp_span
+        if it == "__GAP__":
+            return PK_FLOORPLAN_GAP_SPAN
+        return room_unit
+
+    def _col_row_units(items) -> int:
+        return sum(_item_span(it) for it in items)
+
+    n_rows = max(_col_row_units(c["items"]) for c in columns)
+    # A slim strip across the top, reserved for a shared stage legend
+    # (Baseline/Release/Decay swatches) — one legend covers every panel
+    # since they all use the same stage shading, rather than repeating it
+    # per room. Counted in the same row units as everything else so it's
+    # baked into the fixed 16:9 canvas below, not an extra bleed added on
+    # top of it.
+    legend_rows = max(1, round(n_rows * 0.07)) if stage_defs else 0
+    # A little clearance between the legend strip and the first room's own
+    # title right below it — without this they touch (same gap value
+    # already proven sufficient between two stacked rooms, so reused here).
+    legend_gap = PK_FLOORPLAN_GAP_SPAN if legend_rows else 0
+    content_row0 = legend_rows + legend_gap
+    total_rows = content_row0 + n_rows
+    # 3.7in is "one room's height" — rows are in fine-grained room_unit
+    # subdivisions now (so FP_SPAN can approximate a precisely-measured
+    # fractional multiple of a room's height, e.g. 1.44x), not literally
+    # one GridSpec row per room, so this scales each row by 1/room_unit
+    # rather than treating a row as a whole room.
+    natural_w, natural_h = 5.0 * sum(col_widths), (3.7 / room_unit) * total_rows
+    # Force the overall canvas to 16:9, by *growing* whichever dimension
+    # the natural layout comes up short on — never shrinking either one —
+    # so every room chart (which fills a fixed share of that canvas) ends
+    # up as large as this aspect ratio allows, not smaller.
+    target_ratio = 16.0 / 9.0
+    if natural_w / natural_h < target_ratio:
+        fig_w, fig_h = natural_h * target_ratio, natural_h
+    else:
+        fig_w, fig_h = natural_w, natural_w / target_ratio
+    fig = plt.figure(figsize=(fig_w, fig_h))
+    # hspace=0: with rooms now spanning many fine-grained rows (room_unit
+    # of them) instead of exactly one, matplotlib's hspace fraction gets
+    # applied at *every* row boundary the GridSpec has, including the ones
+    # buried inside a single room's own span — a nonzero hspace here
+    # doesn't just add a gap between rooms, it bloats each room's own
+    # multi-row cell by (room_unit - 1) copies of that gap. Real breathing
+    # room between rooms is inserted explicitly as "__GAP__" entries in
+    # PK_FLOORPLAN_LAYOUT instead (a real, deliberately-sized blank grid
+    # span), which sidesteps this entirely.
+    gs = fig.add_gridspec(
+        total_rows, len(columns), width_ratios=col_widths,
+        hspace=0.0, wspace=PK_FLOORPLAN_WSPACE.get(floor_key, 0.30),
+    )
+
+    if legend_rows:
+        seen_names: set = set()
+        stage_patches = []
+        for (name, _stt, _ett, col) in stage_defs:
+            if name in seen_names:
+                continue
+            seen_names.add(name)
+            stage_patches.append(Patch(facecolor=col, alpha=0.40, label=name))
+        legend_ax = fig.add_subplot(gs[0:legend_rows, :])
+        legend_ax.axis("off")
+        legend_ax.legend(
+            handles=stage_patches, loc="center", ncol=len(stage_patches),
+            frameon=False, fontsize=13,
+        )
+
+    for col_idx, col_spec in enumerate(columns):
+        items = col_spec["items"]
+        col_w = col_spec["width"]
+        has_fp = "__FLOORPLAN__" in items
+        # Columns shared with the floor plan are wider than a room's own
+        # width so the floor plan can be big — but its room(s) still need
+        # to render at the normal room width, not stretched to match. This
+        # nests a normal-width, centered sub-cell for them inside the
+        # wider outer cell (the floor plan itself uses the full outer
+        # cell, no nesting).
+        needs_nesting = has_fp and col_w > PK_FLOORPLAN_ROOM_WIDTH
+        margin = (col_w - PK_FLOORPLAN_ROOM_WIDTH) / 2 if needs_nesting else None
+
+        # Below the legend strip, top-aligned — matching how the reference
+        # poster's own rooms sit (e.g. GF01 starts almost level with the
+        # floor plan's own top, not centered against the whole column).
+        # A short column (like GF's lone GF01) just leaves its own leftover
+        # space at the bottom instead of floating in the middle.
+        row_cursor = content_row0
+        for item in items:
+            span = _item_span(item)
+            if item == "__GAP__":
+                row_cursor += span
+                continue
+            cell = gs[row_cursor : row_cursor + span, col_idx]
+            row_cursor += span
+
+            if item == "__FLOORPLAN__":
+                ax = fig.add_subplot(cell)
+                ax.axis("off")
+                # A visible (opaque white) axes patch here would paint over
+                # any neighboring room's tick labels that happen to dip
+                # into this cell's bounding box (e.g. FF03's rotated x-tick
+                # labels, which extend a bit below FF03's own axes) —
+                # transparent so that can never happen even if the
+                # "__GAP__" clearance above/below ever turns out too small.
+                ax.patch.set_alpha(0.0)
+                if fp_img_path and os.path.exists(fp_img_path):
+                    # Default aspect ("equal") — the floor plan's true
+                    # proportions, not stretched/skewed to fill the cell.
+                    ax.imshow(plt.imread(fp_img_path))
+                else:
+                    ax.text(0.5, 0.5, "Floor plan not found", ha="center", va="center")
+                continue
+
+            if margin is not None:
+                # wspace=0: subgridspec's own default (~0.2) would eat into
+                # the margin/room split, rendering this room narrower than
+                # the width_ratios alone say — which is exactly why FF03/
+                # FF05 came out ~12% narrower than the other 6 rooms.
+                sub = cell.subgridspec(1, 3, width_ratios=[margin, PK_FLOORPLAN_ROOM_WIDTH, margin], wspace=0.0)
+                ax = fig.add_subplot(sub[0, 1])
+            else:
+                ax = fig.add_subplot(cell)
+
+            sensor_ids = sorted(
+                pk_cat.loc[pk_cat["room_group"] == item, "sensor_number"].astype(int).tolist()
+            )
+            ts_room = (
+                sensor_co2_timeseries(df_pk, sensor_ids, align_to, catalog=pk_cat, label_fn=_room_sensor_label)
+                if sensor_ids else pd.DataFrame()
+            )
+            if len(ts_room) == 0:
+                ax.axis("off")
+                ax.text(0.5, 0.5, f"{item}\n(no data)", ha="center", va="center", fontsize=11, fontweight="bold")
+                continue
+            plot_room_sensors_matplotlib(
+                ts_room, item, stage_defs, plot_start, plot_end, y_range=y_range, ax=ax,
+            )
+
+    return fig
 
 
 def add_stage_shading(ax, stage_defs, stage_patches):
@@ -1362,12 +1887,13 @@ def format_z_level_sensor_map(df_region: pd.DataFrame, region_label: str) -> str
     return "\n".join(lines)
 
 
-def vertical_profile_means(df_region: pd.DataFrame, t0, t1, value_col: str) -> pd.DataFrame:
+def vertical_profile_means(df_region: pd.DataFrame, t0, t1, value_col: str, *, inclusive_end: bool = True) -> pd.DataFrame:
     if df_region is None or len(df_region) == 0:
         return pd.DataFrame(columns=["z_level", "z_label", "mean"])
 
     d = df_region.copy()
-    d = d[(d["time"] >= pd.Timestamp(t0)) & (d["time"] <= pd.Timestamp(t1))].copy()
+    end_mask = (d["time"] <= pd.Timestamp(t1)) if inclusive_end else (d["time"] < pd.Timestamp(t1))
+    d = d[(d["time"] >= pd.Timestamp(t0)) & end_mask].copy()
     d[value_col] = pd.to_numeric(d[value_col], errors="coerce")
     d["z_level"] = _assign_z_level(d)
 
@@ -1479,6 +2005,13 @@ def plot_vertical_profiles_plotly(
 # =========================================================
 # Plotting
 # =========================================================
+# These Matplotlib figures are expensive to rebuild (they redraw every point
+# in the aligned time series) and are only ever displayed when Plotly is
+# unavailable or the user opens the Export tab — but Streamlit reruns this
+# whole script on *every* widget interaction, anywhere on any tab. Caching
+# them means a plot-option tweak on an unrelated tab no longer silently
+# rebuilds all four figures in the background on every rerun.
+@st.cache_resource(show_spinner=False)
 def plot_overall_metrics(
     co2_cave,
     co2_pk,
@@ -1492,13 +2025,30 @@ def plot_overall_metrics(
     *,
     line_width: float = 2.0,
     legend_fontsize: int = 9,
+    export_mode: bool = False,
+    y_overrides: Optional[Dict[str, Tuple[float, float]]] = None,
+    use_fixed_y: Optional[bool] = None,
 ):
     lw_c = float(line_width) * 1.5
     lw_p = float(line_width) * 1.0
     lw_dt = float(line_width) * 1.0
-    fig, axs = plt.subplots(5, 2, figsize=(18, 16), sharex=True)
+    # Export figures use larger, fixed font sizes regardless of whatever the
+    # interactive dashboard's font widgets happen to be set to — legibility
+    # in a PPT slide shouldn't depend on an on-screen setting.
+    fs_axis = 15 if export_mode else 12
+    fs_dt = 14 if export_mode else 11
+    fig, axs = plt.subplots(
+        5, 2, figsize=(18, 15.5), sharex=True,
+        gridspec_kw={"hspace": 0.32, "wspace": 0.22} if export_mode else {},
+    )
 
-    titles_co2 = ["Mean CO₂", "Std CO₂", "CV (CO₂)", "Mixing Index (CO₂)", f"Coverage (CO₂ ≥ baseline×{cfg.coverage_factor:.2f})"]
+    # The Coverage label carries the exact threshold formula on-screen (the
+    # rest of the dashboard has room for it); the export version keeps just
+    # "Coverage (%)" so the rotated y-label isn't so long it collides with
+    # the row above/below it — the threshold factor is still in the sidebar
+    # and summary table.
+    coverage_label = "Coverage (%)" if export_mode else f"Coverage (CO₂ ≥ baseline×{cfg.coverage_factor:.2f})"
+    titles_co2 = ["Mean CO₂", "Std CO₂", "CV (CO₂)", "Mixing Index (CO₂)", coverage_label]
     titles_T = ["Mean T (°C)", "Std T (°C)", "ΔT(high-low) (°C)", "R²(T~z)", "Mixing Index (T)"]
 
     axs[0, 0].plot(co2_cave["mean"].index, co2_cave["mean"].values, linewidth=lw_c, label="CAVE mean")
@@ -1521,7 +2071,7 @@ def plot_overall_metrics(
 
     ax_dt = axs[0, 1].twinx()
     ax_dt.plot(deltaT_pk_minus_cave.index, deltaT_pk_minus_cave.values, linewidth=lw_dt, linestyle=":", label="ΔT (PK − CAVE)")
-    ax_dt.set_ylabel("ΔT (°C)", fontsize=11, fontweight="bold")
+    ax_dt.set_ylabel("ΔT (°C)", fontsize=fs_dt, fontweight="bold")
     axs[0, 1]._ax_dt = ax_dt
 
     axs[1, 1].plot(temp_cave["std_T"].index, temp_cave["std_T"].values, linewidth=lw_c, label="CAVE std T")
@@ -1540,16 +2090,20 @@ def plot_overall_metrics(
     for r in range(5):
         for c in range(2):
             ax = axs[r, c]
-            ax.grid(True)
+            if export_mode:
+                ax.grid(True, color="0.85", linewidth=0.6)
+                ax.set_axisbelow(True)
+            else:
+                ax.grid(True)
             if stage_defs:
                 add_stage_shading(ax, stage_defs, stage_patches)
 
     for i in range(5):
-        axs[i, 0].set_ylabel(titles_co2[i], fontsize=12, fontweight="bold")
-        axs[i, 1].set_ylabel(titles_T[i], fontsize=12, fontweight="bold")
+        axs[i, 0].set_ylabel(titles_co2[i], fontsize=fs_axis, fontweight="bold")
+        axs[i, 1].set_ylabel(titles_T[i], fontsize=fs_axis, fontweight="bold")
 
     for ax in axs[-1, :]:
-        ax.set_xlabel("Time", fontsize=12, fontweight="bold")
+        ax.set_xlabel("Time", fontsize=fs_axis, fontweight="bold")
         ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
 
     if plot_start is not None and plot_end is not None:
@@ -1560,33 +2114,76 @@ def plot_overall_metrics(
     plt.setp(axs[-1, 0].get_xticklabels(), rotation=45)
     plt.setp(axs[-1, 1].get_xticklabels(), rotation=45)
 
-    leg_fs = max(5, min(24, int(legend_fontsize)))
+    leg_fs = 16 if export_mode else max(5, min(24, int(legend_fontsize)))
+
+    # R²/Coverage/Temp-MI have a genuine fixed domain in practice: R² of an
+    # OLS fit on its own training data is always in [0,1]; Coverage is a %
+    # of samples; Temp Mixing Index (unlike CO2 MI) stays comfortably inside
+    # [0,1] for real data (temperature is far more spatially uniform than
+    # CO2 during a release, so its CV never approaches 1). These three
+    # always default to fixed 0-1/0-100, independent of the master "Use
+    # fixed y-limits" toggle below — still overridable by typing different
+    # min/max into that panel's own Y-axis limits box.
+    #
+    # CO2 Mixing Index = 1 - CV does NOT get this treatment: CO2's CV
+    # regularly exceeds 1 right as a release starts (real PK MI here ranges
+    # -1.29 to 0.98), so it follows the master toggle/auto-fit like every
+    # other concentration/temperature/delta panel — a fixed [0,1] clamp
+    # would silently clip it.
+    y = cfg.ylims
+    _always_fixed = {"co2_coverage", "temp_r2", "temp_mi"}
+
+    def _panel_ylim(key: str, *series) -> Tuple[float, float]:
+        if key in _always_fixed:
+            src = y_overrides if (export_mode and y_overrides) else y
+            return src.get(key, y[key])
+        if export_mode and use_fixed_y is not None:
+            if use_fixed_y:
+                src = y_overrides if y_overrides else y
+                return src.get(key, y[key])
+            return _auto_ylim(*series) or y[key]
+        return _auto_ylim(*series) or y[key]
+
+    axs[0, 0].set_ylim(*_panel_ylim("co2_mean", co2_cave["mean"], co2_pk["mean"]))
+    axs[1, 0].set_ylim(*_panel_ylim("co2_std", co2_cave["std"], co2_pk["std"]))
+    axs[2, 0].set_ylim(*_panel_ylim("co2_cv", co2_cave["cv"], co2_pk["cv"]))
+    axs[3, 0].set_ylim(*_panel_ylim("co2_mi", co2_cave["mi"], co2_pk["mi"]))
+    axs[4, 0].set_ylim(*_panel_ylim("co2_coverage", co2_cave["coverage"], co2_pk["coverage"]))
+
+    axs[0, 1].set_ylim(*_panel_ylim("temp_mean", temp_cave["mean_T"], temp_pk["mean_T"]))
+    axs[1, 1].set_ylim(*_panel_ylim("temp_std", temp_cave["std_T"], temp_pk["std_T"]))
+    axs[2, 1].set_ylim(*_panel_ylim("temp_deltaT", temp_cave["deltaT"], temp_pk["deltaT"]))
+    axs[3, 1].set_ylim(*_panel_ylim("temp_r2", temp_cave["r2_Tz"], temp_pk["r2_Tz"]))
+    axs[4, 1].set_ylim(*_panel_ylim("temp_mi", temp_cave["mi_T"], temp_pk["mi_T"]))
+    axs[0, 1]._ax_dt.set_ylim(*_panel_ylim("temp_pk_minus_cave", deltaT_pk_minus_cave))
+
+    # Finalize the layout *before* placing the figure-level legend, so its
+    # anchor (computed from each axes' real post-layout position) is correct.
+    if export_mode:
+        plt.tight_layout()
+    else:
+        plt.suptitle(f"{cfg.exp_code} — Overall metrics (CAVE vs PK)", fontsize=14, fontweight="bold")
+        plt.tight_layout(rect=[0, 0, 1, 0.96])
 
     h1, l1 = axs[0, 1].get_legend_handles_labels()
     h2, l2 = axs[0, 1]._ax_dt.get_legend_handles_labels()
-    axs[0, 1].legend(h1 + h2, l1 + l2, loc="upper right", frameon=True, fontsize=leg_fs)
-    axs[0, 0].legend(loc="upper right", frameon=True, fontsize=leg_fs)
+    if export_mode:
+        # Every one of the 10 panels reuses the same colour/linestyle
+        # convention (solid = CAVE, dashed = PK), plus one ΔT series and the
+        # stage shading — so one shared legend for the whole figure covers
+        # it, instead of a separate box per panel.
+        h_cave, h_pk = axs[0, 0].get_legend_handles_labels()[0][:2]
+        all_handles = [h_cave, h_pk] + h2 + list(stage_patches)
+        all_labels = ["CAVE", "PK", "ΔT (PK − CAVE)"] + [p.get_label() for p in stage_patches]
+        _export_figlegend(fig, all_handles, all_labels, where="bottom", fontsize=leg_fs, anchor_ax=[axs[-1, 0], axs[-1, 1]])
+    else:
+        axs[0, 1].legend(h1 + h2, l1 + l2, loc="upper right", frameon=True, fontsize=leg_fs)
+        axs[0, 0].legend(loc="upper right", frameon=True, fontsize=leg_fs)
 
-    if cfg.use_fixed_ylims:
-        y = cfg.ylims
-        axs[0, 0].set_ylim(*y["co2_mean"])
-        axs[1, 0].set_ylim(*y["co2_std"])
-        axs[2, 0].set_ylim(*y["co2_cv"])
-        axs[3, 0].set_ylim(*y["co2_mi"])
-        axs[4, 0].set_ylim(*y["co2_coverage"])
-
-        axs[0, 1].set_ylim(*y["temp_mean"])
-        axs[1, 1].set_ylim(*y["temp_std"])
-        axs[2, 1].set_ylim(*y["temp_deltaT"])
-        axs[3, 1].set_ylim(*y["temp_r2"])
-        axs[4, 1].set_ylim(*y["temp_mi"])
-        axs[0, 1]._ax_dt.set_ylim(*y["temp_pk_minus_cave"])
-
-    plt.suptitle(f"{cfg.exp_code} — Overall metrics (CAVE vs PK)", fontsize=14, fontweight="bold")
-    plt.tight_layout(rect=[0, 0, 1, 0.96])
     return fig
 
 
+@st.cache_resource(show_spinner=False)
 def plot_zone_co2(
     cave_zone_co2,
     pk_zone_co2,
@@ -1599,35 +2196,52 @@ def plot_zone_co2(
     pk_line_width: float = 2.0,
     cave_legend_fs: int = 9,
     pk_legend_fs: int = 9,
+    export_mode: bool = False,
+    cave_y_range: Optional[Tuple[float, float]] = None,
+    pk_y_range: Optional[Tuple[float, float]] = None,
 ):
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 10), sharex=True)
-    lfc = max(5, min(24, int(cave_legend_fs)))
-    lfp = max(5, min(24, int(pk_legend_fs)))
+    fig, (ax1, ax2) = plt.subplots(
+        2, 1, figsize=(14, 9), sharex=True,
+        gridspec_kw={"hspace": 0.12 if export_mode else None},
+    )
+    fs_axis = 18 if export_mode else 12
+    lfc = 15 if export_mode else max(5, min(24, int(cave_legend_fs)))
+    lfp = 15 if export_mode else max(5, min(24, int(pk_legend_fs)))
 
+    if export_mode:
+        ax1.set_prop_cycle(color=_journal_colors(max(len(cave_zone_co2.columns), 1)))
+        ax2.set_prop_cycle(color=_journal_colors(max(len(pk_zone_co2.columns), 1)))
+
+    stage_patches_c: list = []
     for col in cave_zone_co2.columns:
         ax1.plot(cave_zone_co2.index, cave_zone_co2[col].values, linewidth=cave_line_width, label=col)
 
     if stage_defs:
-        stage_patches_c = []
         add_stage_shading(ax1, stage_defs, stage_patches_c)
 
-    ax1.set_title(f"{cfg.exp_code} — CAVE selected walls mean CO₂", fontsize=13, fontweight="bold")
-    ax1.set_ylabel("CO₂ (ppm)", fontsize=12, fontweight="bold")
-    ax1.grid(True)
-    ax1.legend(fontsize=lfc, frameon=True, loc="upper right")
+    if not export_mode:
+        ax1.set_title(f"{cfg.exp_code} — CAVE selected walls mean CO₂", fontsize=13, fontweight="bold")
+    ax1.set_ylabel("CO₂ (ppm)", fontsize=fs_axis, fontweight="bold")
+    ax1.grid(True, color="0.85", linewidth=0.6)
+    ax1.set_axisbelow(True)
+    if not export_mode:
+        ax1.legend(fontsize=lfc, frameon=True, loc="upper right")
 
+    stage_patches_b: list = []
     for col in pk_zone_co2.columns:
         ax2.plot(pk_zone_co2.index, pk_zone_co2[col].values, linewidth=pk_line_width, label=col)
 
     if stage_defs:
-        stage_patches_b = []
         add_stage_shading(ax2, stage_defs, stage_patches_b)
 
-    ax2.set_title(f"{cfg.exp_code} — PK zones mean CO₂ (by wall)", fontsize=13, fontweight="bold")
-    ax2.set_ylabel("CO₂ (ppm)", fontsize=12, fontweight="bold")
-    ax2.set_xlabel("Time", fontsize=12, fontweight="bold")
-    ax2.grid(True)
-    ax2.legend(ncol=4, fontsize=lfp, frameon=True, loc="upper right")
+    if not export_mode:
+        ax2.set_title(f"{cfg.exp_code} — PK zones mean CO₂ (by wall)", fontsize=13, fontweight="bold")
+    ax2.set_ylabel("CO₂ (ppm)", fontsize=fs_axis, fontweight="bold")
+    ax2.set_xlabel("Time", fontsize=fs_axis, fontweight="bold")
+    ax2.grid(True, color="0.85", linewidth=0.6)
+    ax2.set_axisbelow(True)
+    if not export_mode:
+        ax2.legend(ncol=4, fontsize=lfp, frameon=True, loc="upper right")
 
     ax2.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
     plt.xticks(rotation=45)
@@ -1635,14 +2249,36 @@ def plot_zone_co2(
     if plot_start is not None and plot_end is not None:
         ax1.set_xlim(plot_start, plot_end)
 
-    if cfg.use_fixed_ylims:
-        ax1.set_ylim(*cfg.ylims["zone_cave_co2"])
-        ax2.set_ylim(*cfg.ylims["zone_pk_co2"])
+    # In export_mode, mirror whatever the matching interactive panel is
+    # currently showing (its "use fixed y-limits" state), rather than always
+    # recomputing independently — so if you've zoomed/customised on screen,
+    # the downloaded figure matches what you're looking at.
+    ax1.set_ylim(*(cave_y_range if export_mode else None) or (_auto_ylim(*[cave_zone_co2[c] for c in cave_zone_co2.columns]) or cfg.ylims["zone_cave_co2"]))
+    ax2.set_ylim(*(pk_y_range if export_mode else None) or (_auto_ylim(*[pk_zone_co2[c] for c in pk_zone_co2.columns]) or cfg.ylims["zone_pk_co2"]))
 
+    # Finalize layout *before* placing the figure-level legends, so their
+    # anchors (computed from each axes' real post-layout position) are correct.
     plt.tight_layout()
+
+    if export_mode:
+        # Different series per panel (CAVE walls vs PK sensors) — keep two
+        # separate legends so it's unambiguous which belongs to which chart:
+        # top panel's legend at the very top of the figure, bottom panel's
+        # legend at the very bottom. Stage shading is common to both panels,
+        # so it's repeated in both legends rather than only the top one.
+        h_top, l_top = ax1.get_legend_handles_labels()
+        h_top = h_top + list(stage_patches_c)
+        l_top = l_top + [p.get_label() for p in stage_patches_c]
+        _export_figlegend(fig, h_top, l_top, where="top", fontsize=lfc, anchor_ax=ax1)
+        h_bot, l_bot = ax2.get_legend_handles_labels()
+        h_bot = h_bot + list(stage_patches_b)
+        l_bot = l_bot + [p.get_label() for p in stage_patches_b]
+        _export_figlegend(fig, h_bot, l_bot, where="bottom", fontsize=lfp, anchor_ax=ax2)
+
     return fig
 
 
+@st.cache_resource(show_spinner=False)
 def plot_zone_temp(
     cave_zone_temp,
     pk_zone_temp,
@@ -1655,35 +2291,58 @@ def plot_zone_temp(
     pk_line_width: float = 2.0,
     cave_legend_fs: int = 9,
     pk_legend_fs: int = 9,
+    export_mode: bool = False,
+    cave_y_range: Optional[Tuple[float, float]] = None,
+    pk_y_range: Optional[Tuple[float, float]] = None,
 ):
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 10), sharex=True)
-    lfc = max(5, min(24, int(cave_legend_fs)))
-    lfp = max(5, min(24, int(pk_legend_fs)))
+    fig, (ax1, ax2) = plt.subplots(
+        2, 1, figsize=(14, 9), sharex=True,
+        gridspec_kw={"hspace": 0.12 if export_mode else None},
+    )
+    fs_axis = 18 if export_mode else 12
+    lfc = 15 if export_mode else max(5, min(24, int(cave_legend_fs)))
+    lfp = 15 if export_mode else max(5, min(24, int(pk_legend_fs)))
 
+    if export_mode:
+        ax1.set_prop_cycle(color=_journal_colors(max(len(cave_zone_temp.columns), 1)))
+        ax2.set_prop_cycle(color=_journal_colors(max(len(pk_zone_temp.columns), 1)))
+
+    stage_patches_c: list = []
     for col in cave_zone_temp.columns:
         ax1.plot(cave_zone_temp.index, cave_zone_temp[col].values, linewidth=cave_line_width, label=col)
 
     if stage_defs:
-        stage_patches_c = []
         add_stage_shading(ax1, stage_defs, stage_patches_c)
 
-    ax1.set_title(f"{cfg.exp_code} — CAVE selected walls mean temperature", fontsize=13, fontweight="bold")
-    ax1.set_ylabel("Temperature (°C)", fontsize=12, fontweight="bold")
-    ax1.grid(True)
-    ax1.legend(fontsize=lfc, frameon=True, loc="upper right")
+    if not export_mode:
+        ax1.set_title(f"{cfg.exp_code} — CAVE selected walls mean temperature", fontsize=13, fontweight="bold")
+    ax1.set_ylabel("Temperature (°C)", fontsize=fs_axis, fontweight="bold")
+    if export_mode:
+        ax1.grid(True, color="0.85", linewidth=0.6)
+        ax1.set_axisbelow(True)
+    else:
+        ax1.grid(True)
+    if not export_mode:
+        ax1.legend(fontsize=lfc, frameon=True, loc="upper right")
 
+    stage_patches_b: list = []
     for col in pk_zone_temp.columns:
         ax2.plot(pk_zone_temp.index, pk_zone_temp[col].values, linewidth=pk_line_width, label=col)
 
     if stage_defs:
-        stage_patches_b = []
         add_stage_shading(ax2, stage_defs, stage_patches_b)
 
-    ax2.set_title(f"{cfg.exp_code} — PK zones mean temperature (by wall)", fontsize=13, fontweight="bold")
-    ax2.set_ylabel("Temperature (°C)", fontsize=12, fontweight="bold")
-    ax2.set_xlabel("Time", fontsize=12, fontweight="bold")
-    ax2.grid(True)
-    ax2.legend(ncol=4, fontsize=lfp, frameon=True, loc="upper right")
+    if not export_mode:
+        ax2.set_title(f"{cfg.exp_code} — PK zones mean temperature (by wall)", fontsize=13, fontweight="bold")
+    ax2.set_ylabel("Temperature (°C)", fontsize=fs_axis, fontweight="bold")
+    ax2.set_xlabel("Time", fontsize=fs_axis, fontweight="bold")
+    if export_mode:
+        ax2.grid(True, color="0.85", linewidth=0.6)
+        ax2.set_axisbelow(True)
+    else:
+        ax2.grid(True)
+    if not export_mode:
+        ax2.legend(ncol=4, fontsize=lfp, frameon=True, loc="upper right")
 
     ax2.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
     plt.xticks(rotation=45)
@@ -1691,15 +2350,36 @@ def plot_zone_temp(
     if plot_start is not None and plot_end is not None:
         ax1.set_xlim(plot_start, plot_end)
 
+    # In export_mode, mirror whatever the matching interactive panel is
+    # currently showing, rather than always auto-fitting independently.
+    if export_mode:
+        ax1.set_ylim(*(cave_y_range or _auto_ylim(*[cave_zone_temp[c] for c in cave_zone_temp.columns]) or (0.0, 1.0)))
+        ax2.set_ylim(*(pk_y_range or _auto_ylim(*[pk_zone_temp[c] for c in pk_zone_temp.columns]) or (0.0, 1.0)))
+
+    # Finalize layout *before* placing the figure-level legends, so their
+    # anchors (computed from each axes' real post-layout position) are correct.
     plt.tight_layout()
+
+    if export_mode:
+        h_top, l_top = ax1.get_legend_handles_labels()
+        h_top = h_top + list(stage_patches_c)
+        l_top = l_top + [p.get_label() for p in stage_patches_c]
+        _export_figlegend(fig, h_top, l_top, where="top", fontsize=lfc, anchor_ax=ax1)
+        h_bot, l_bot = ax2.get_legend_handles_labels()
+        h_bot = h_bot + list(stage_patches_b)
+        l_bot = l_bot + [p.get_label() for p in stage_patches_b]
+        _export_figlegend(fig, h_bot, l_bot, where="bottom", fontsize=lfp, anchor_ax=ax2)
+
     return fig
 
 
-def plot_mfc(mfc_df, t_on, t_off, t_rel0, t_rel1, cfg: AppConfig, *, line_width: float = 2.2, legend_fontsize: int = 10):
+@st.cache_resource(show_spinner=False)
+def plot_mfc(mfc_df, t_on, t_off, t_rel0, t_rel1, cfg: AppConfig, *, line_width: float = 2.2, legend_fontsize: int = 10, export_mode: bool = False, x_range: Optional[Tuple[Any, Any]] = None, y_range: Optional[Tuple[float, float]] = None):
     lw = float(line_width)
-    leg_fs = max(5, min(24, int(legend_fontsize)))
+    leg_fs = 15 if export_mode else max(5, min(24, int(legend_fontsize)))
+    fs_axis = 18 if export_mode else 12
     has_temp = mfc_has_temperature(mfc_df)
-    fig, ax = plt.subplots(figsize=(14, 4.8))
+    fig, ax = plt.subplots(figsize=(14, 5))
     ax.plot(
         mfc_df["t"],
         mfc_df["F"],
@@ -1720,7 +2400,7 @@ def plot_mfc(mfc_df, t_on, t_off, t_rel0, t_rel1, cfg: AppConfig, *, line_width:
             linestyle="-",
             label="Temperature (°C)",
         )
-        ax2.set_ylabel("Temperature (°C)", fontsize=12, fontweight="bold", color="#d62728")
+        ax2.set_ylabel("Temperature (°C)", fontsize=fs_axis, fontweight="bold", color="#d62728")
         ax2.tick_params(axis="y", labelcolor="#d62728")
 
     if (t_on is not None) and (t_off is not None):
@@ -1729,27 +2409,172 @@ def plot_mfc(mfc_df, t_on, t_off, t_rel0, t_rel1, cfg: AppConfig, *, line_width:
     if (t_rel0 is not None) and (t_rel1 is not None):
         ax.axvspan(t_rel0, t_rel1, alpha=0.10, color="orange", label="Stage2 (Release)")
 
-    title = f"{cfg.exp_code} — MFC Release Quicklook"
-    if has_temp:
-        title += " (flow + temperature)"
-    ax.set_title(title, fontsize=12, fontweight="bold")
-    ax.set_ylabel("Flow (MFC units)", fontsize=12, fontweight="bold", color="#1f77b4")
+    if not export_mode:
+        title = f"{cfg.exp_code} — MFC Release Quicklook"
+        if has_temp:
+            title += " (flow + temperature)"
+        ax.set_title(title, fontsize=12, fontweight="bold")
+    ax.set_ylabel("Flow (MFC units)", fontsize=fs_axis, fontweight="bold", color="#1f77b4")
     ax.tick_params(axis="y", labelcolor="#1f77b4")
-    ax.set_xlabel("Time", fontsize=12, fontweight="bold")
-    ax.grid(True)
+    ax.set_xlabel("Time", fontsize=fs_axis, fontweight="bold")
+    if export_mode:
+        ax.grid(True, color="0.85", linewidth=0.6)
+        ax.set_axisbelow(True)
+    else:
+        ax.grid(True)
     ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
     plt.xticks(rotation=45)
 
-    if (t_rel0 is not None) and (t_rel1 is not None):
+    # In export_mode, mirror whatever the interactive MFC panel is currently
+    # showing (its lock-to-release / custom-y-limits state) rather than
+    # always locking to the release window.
+    if export_mode and x_range is not None and x_range[0] is not None and x_range[1] is not None:
+        ax.set_xlim(*x_range)
+    elif (t_rel0 is not None) and (t_rel1 is not None):
         ax.set_xlim(t_rel0, t_rel1)
+    if export_mode and y_range is not None:
+        ax.set_ylim(*y_range)
+
+    # Finalize layout *before* placing the figure-level legend, so its
+    # anchor (computed from the axes' real post-layout position) is correct.
+    plt.tight_layout()
 
     h1, l1 = ax.get_legend_handles_labels()
     if ax2 is not None:
         h2, l2 = ax2.get_legend_handles_labels()
+    else:
+        h2, l2 = [], []
+    if export_mode:
+        _export_figlegend(fig, h1 + h2, l1 + l2, where="bottom", fontsize=leg_fs, anchor_ax=ax)
+    elif ax2 is not None:
         ax.legend(h1 + h2, l1 + l2, frameon=True, fontsize=leg_fs, loc="upper right")
     else:
         ax.legend(frameon=True, fontsize=leg_fs, loc="upper right")
+    return fig
+
+
+@st.cache_resource(show_spinner=False)
+def plot_humidity_export(
+    rh_cave,
+    rh_pk,
+    stage_defs,
+    cfg: AppConfig,
+    plot_start,
+    plot_end,
+    *,
+    line_width: float = 2.0,
+    mean_y_range: Optional[Tuple[float, float]] = None,
+    std_y_range: Optional[Tuple[float, float]] = None,
+):
+    """Report-ready CAVE vs PK humidity overview: no title, external legend,
+    fonts/colours matching the other export figures. Export-only (the
+    interactive on-screen chart is plot_humidity_overview_plotly), so unlike
+    plot_overall_metrics etc. there's no export_mode switch here."""
+    lw_c = float(line_width) * 1.5
+    lw_p = float(line_width) * 1.0
+    fs_axis = 16
+    fig, axs = plt.subplots(2, 1, figsize=(12, 8), sharex=True, gridspec_kw={"hspace": 0.15})
+
+    axs[0].plot(rh_cave["mean"].index, rh_cave["mean"].values, linewidth=lw_c, label="CAVE mean RH")
+    axs[0].plot(rh_pk["mean"].index, rh_pk["mean"].values, linewidth=lw_p, linestyle="--", label="PK mean RH")
+    axs[1].plot(rh_cave["std"].index, rh_cave["std"].values, linewidth=lw_c, label="CAVE std RH")
+    axs[1].plot(rh_pk["std"].index, rh_pk["std"].values, linewidth=lw_p, linestyle="--", label="PK std RH")
+
+    stage_patches: list = []
+    for ax in axs:
+        ax.grid(True, color="0.85", linewidth=0.6)
+        ax.set_axisbelow(True)
+        if stage_defs:
+            add_stage_shading(ax, stage_defs, stage_patches)
+
+    axs[0].set_ylabel("Mean RH (%)", fontsize=fs_axis, fontweight="bold")
+    axs[1].set_ylabel("Std RH (%)", fontsize=fs_axis, fontweight="bold")
+    axs[1].set_xlabel("Time", fontsize=fs_axis, fontweight="bold")
+    axs[1].xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
+    plt.setp(axs[1].get_xticklabels(), rotation=45)
+
+    if plot_start is not None and plot_end is not None:
+        for ax in axs:
+            ax.set_xlim(plot_start, plot_end)
+
+    axs[0].set_ylim(*(mean_y_range or _auto_ylim(rh_cave["mean"], rh_pk["mean"]) or cfg.ylims["rh_mean"]))
+    axs[1].set_ylim(*(std_y_range or _auto_ylim(rh_cave["std"], rh_pk["std"]) or cfg.ylims["rh_std"]))
+
+    # Finalize layout *before* placing the figure-level legend, so its
+    # anchor (computed from the axes' real post-layout position) is correct.
     plt.tight_layout()
+
+    h_cave, h_pk = axs[0].get_legend_handles_labels()[0][:2]
+    all_handles = [h_cave, h_pk] + list(stage_patches)
+    all_labels = ["CAVE", "PK"] + [p.get_label() for p in stage_patches]
+    _export_figlegend(fig, all_handles, all_labels, where="bottom", fontsize=14, anchor_ax=axs[1])
+    return fig
+
+
+@st.cache_resource(show_spinner=False)
+def plot_vertical_profiles_export(
+    cave_profiles,
+    pk_profiles,
+    x_label: str,
+    cave_x_range,
+    pk_x_range,
+    cave_y_range,
+    pk_y_range,
+    *,
+    line_width: float = 2.2,
+    marker_size: float = 7.0,
+):
+    """Report-ready CAVE|PK vertical profile pair (W1-W5 within the selected
+    stage), no title, one shared external legend — mirrors the two-panel
+    layout of plot_zone_co2/plot_zone_temp. Export-only: the on-screen
+    version is plot_vertical_profiles_plotly (or the matplotlib fallback),
+    each drawn as 4 separate single-region panels."""
+    # Tall/narrow panels, matching the on-screen profile charts' own shape —
+    # each of the two columns keeps a 1:2.5 width:height ratio.
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(7.2, 9.0))
+    fs_axis = 16
+    colors = _journal_colors(max(len(cave_profiles), len(pk_profiles), 1))
+    z_ticks = list(range(0, 11))
+    z_labels = [f"z{i}" if i > 0 else "z0" for i in range(0, 11)]
+
+    for ax, profiles, xr, yr in [
+        (ax1, cave_profiles, cave_x_range, cave_y_range),
+        (ax2, pk_profiles, pk_x_range, pk_y_range),
+    ]:
+        ax.set_prop_cycle(color=colors)
+        for label, dfp in profiles:
+            if dfp is None or len(dfp) == 0:
+                continue
+            ax.plot(
+                dfp["mean"].values, dfp["z_level"].values, marker="o",
+                linewidth=float(line_width), markersize=float(marker_size), label=label,
+            )
+        ax.grid(True, color="0.85", linewidth=0.6)
+        ax.set_axisbelow(True)
+        ax.set_xlabel(x_label, fontsize=fs_axis, fontweight="bold")
+        if xr is not None:
+            ax.set_xlim(xr[0], xr[1])
+        ax.set_yticks(z_ticks)
+        ax.set_yticklabels(z_labels)
+        if yr is not None:
+            ax.set_ylim(yr[0], yr[1])
+
+    ax1.set_ylabel("z slice", fontsize=fs_axis, fontweight="bold")
+
+    # Finalize layout *before* placing the figure-level legend, so its
+    # anchor (computed from each axes' real post-layout position) is correct.
+    plt.tight_layout()
+
+    h1, l1 = ax1.get_legend_handles_labels()
+    h2, l2 = ax2.get_legend_handles_labels()
+    seen: set = set()
+    h_all, l_all = [], []
+    for hh, ll in list(zip(h1, l1)) + list(zip(h2, l2)):
+        if ll not in seen:
+            seen.add(ll)
+            h_all.append(hh)
+            l_all.append(ll)
+    _export_figlegend(fig, h_all, l_all, where="bottom", fontsize=13, anchor_ax=[ax1, ax2])
     return fig
 
 
@@ -2470,7 +3295,12 @@ OVERALL_WIDGET_DEFAULTS: Dict[str, Any] = {
     "legend_bold": True,
     "legend_fs": 12,
     "show_subplot_titles": False,
-    "use_fixed_y": True,
+    # Default to auto-scaled y, not the fixed cfg.ylims defaults — those are
+    # generic guesses and can silently clip a real release (e.g. CO2 mean
+    # above 1300 ppm). The export PNG now mirrors this panel's own setting,
+    # so a fresh session's downloaded figure should default to "safe" too;
+    # still fully overridable on screen if you want a fixed scale.
+    "use_fixed_y": False,
     "pre_min": 0,
     "x_mode": "Full data (+ pre-minutes)",
     "line_width": 3.0,
@@ -3034,14 +3864,21 @@ def plot_overall_metrics_plotly(
         fig.update_yaxes(range=list(y["co2_std"]), row=2, col=1)
         fig.update_yaxes(range=list(y["co2_cv"]), row=3, col=1)
         fig.update_yaxes(range=list(y["co2_mi"]), row=4, col=1)
-        fig.update_yaxes(range=list(y["co2_coverage"]), row=5, col=1)
 
         fig.update_yaxes(range=list(y["temp_mean"]), row=1, col=2, secondary_y=False)
         fig.update_yaxes(range=list(y["temp_std"]), row=2, col=2)
         fig.update_yaxes(range=list(y["temp_deltaT"]), row=3, col=2)
-        fig.update_yaxes(range=list(y["temp_r2"]), row=4, col=2)
-        fig.update_yaxes(range=list(y["temp_mi"]), row=5, col=2)
         fig.update_yaxes(range=list(y["temp_pk_minus_cave"]), row=1, col=2, secondary_y=True)
+
+    # Coverage/R²/Temp-MI have a genuine fixed domain (0-100 or 0-1) and stay
+    # on that fixed scale regardless of the "Use fixed y-limits" toggle above
+    # — CO2 Mixing Index doesn't get this, since MI = 1 - CV and CO2's CV
+    # regularly exceeds 1 right as a release starts (real data here goes as
+    # low as MI = -1.29), so a [0,1] clamp would silently clip it.
+    y_always = yref if yref is not None else cfg.ylims
+    fig.update_yaxes(range=list(y_always["co2_coverage"]), row=5, col=1)
+    fig.update_yaxes(range=list(y_always["temp_r2"]), row=4, col=2)
+    fig.update_yaxes(range=list(y_always["temp_mi"]), row=5, col=2)
 
     fig.update_layout(
         height=1100,
@@ -3384,14 +4221,18 @@ mfc_file = st.sidebar.file_uploader(
 )
 
 def _upload_signature(file_obj) -> str:
+    """Cheap identity check for 'did the upload change' — avoids hashing the
+    full file on every Streamlit rerun. Streamlit's UploadedFile carries a
+    stable file_id per upload; name+size is a good enough fallback."""
     if file_obj is None:
         return ""
+    file_id = getattr(file_obj, "file_id", None)
+    if file_id:
+        return f"{getattr(file_obj, 'name', '')}|{file_id}"
     try:
-        b = file_obj.getvalue()
-        h = hashlib.md5(b).hexdigest()
-        return f"{getattr(file_obj, 'name', '')}|{len(b)}|{h}"
+        return f"{getattr(file_obj, 'name', '')}|{file_obj.size}"
     except Exception:
-        return f"{getattr(file_obj, 'name', '')}|na|na"
+        return f"{getattr(file_obj, 'name', '')}|na"
 
 
 _sig = "|".join([_upload_signature(explora_file), _upload_signature(stage_file), _upload_signature(mfc_file)])
@@ -3889,11 +4730,17 @@ except Exception as e:
 # =========================================================
 # Tabs
 # =========================================================
-tab1, tab2, tab3, tab4, tab5, tab6, tab_ae, tab7, tab8 = st.tabs(
+# Note: the tab *variable* names below are out of numerical order on purpose
+# — tab9 is the PK Rooms view and tab_ae is Air Exchange; both are defined
+# far below, and this ordering lets each render in its intended place without
+# relocating those blocks. Streamlit only cares about the position of each
+# variable in this list, not what it is named.
+tab1, tab2, tab3, tab9, tab4, tab5, tab6, tab_ae, tab7, tab8 = st.tabs(
     [
         "Data Preview",
         "Overall Metrics",
         "Zone CO₂ & Temperature",
+        "PK Rooms (Floor Plan)",
         "Sensor CO₂ & Temp",
         "Humidity",
         "Vertical Profiles (Decay)",
@@ -4033,8 +4880,12 @@ with tab3:
         st.warning("Plotly not installed; showing static matplotlib figure. To enable hover, run: pip install plotly")
         show_matplotlib_fig(fig_zone, stage_defs)
     else:
-        dc_cave_co2 = zone_ts_page_defaults(cfg.ylims, "zone_cave_co2")
-        dc_pk_co2 = zone_ts_page_defaults(cfg.ylims, "zone_pk_co2")
+        # Default to auto-scaled y (not the fixed 350-1300 default) so a
+        # fresh session — and its exported PNG, which now mirrors this panel
+        # — doesn't silently clip a release that goes higher, the way the
+        # old fixed default did. Still fully overridable on screen.
+        dc_cave_co2 = {**zone_ts_page_defaults(cfg.ylims, "zone_cave_co2"), "use_fixed_y": False}
+        dc_pk_co2 = {**zone_ts_page_defaults(cfg.ylims, "zone_pk_co2"), "use_fixed_y": False}
         dc_cave_t = {**ZONE_WIDGET_DEFAULTS, "y_min": 8.0, "y_max": 30.0, "use_fixed_y": False, "show_markers": False}
         dc_pk_t = {**ZONE_WIDGET_DEFAULTS, "y_min": 8.0, "y_max": 30.0, "use_fixed_y": False, "show_markers": False}
 
@@ -4092,6 +4943,7 @@ with tab3:
             show_markers=mk_c,
             line_width=lw_zcc,
             marker_size=ms_zcc,
+            legend_in_plot=False,
         )
         fig_pk_zone_co2 = plot_zone_single_plotly(
             pk_zone_co2,
@@ -4104,11 +4956,21 @@ with tab3:
             show_markers=mk_p,
             line_width=lw_zcp,
             marker_size=ms_zcp,
+            legend_in_plot=False,
         )
-        apply_plotly_style(fig_cave_zone_co2, _style_from_prefix("zco2_cave"))
-        apply_plotly_style(fig_pk_zone_co2, _style_from_prefix("zco2_pk"))
-        show_plotly_chart(fig_cave_zone_co2, stage_defs, show_stage_legend=False)
-        show_plotly_chart(fig_pk_zone_co2, stage_defs)
+        # Legend moves below the chart (as chips, wrapping/scrolling if long)
+        # instead of Plotly's default inside-the-plot legend — with up to 19
+        # PK sensors, an in-plot legend covers real data.
+        apply_plotly_style(fig_cave_zone_co2, {**_style_from_prefix("zco2_cave"), "show_legend": False})
+        apply_plotly_style(fig_pk_zone_co2, {**_style_from_prefix("zco2_pk"), "show_legend": False})
+        show_plotly_chart(
+            fig_cave_zone_co2, stage_defs, show_stage_legend=False,
+            external_series_legend=True, series_legend_title="CAVE walls",
+        )
+        show_plotly_chart(
+            fig_pk_zone_co2, stage_defs,
+            external_series_legend=True, series_legend_title="PK zones (by wall)",
+        )
 
     st.write("**CAVE zone mean preview**")
     st.dataframe(cave_zone_co2.head(20), use_container_width=True)
@@ -4177,6 +5039,7 @@ with tab3:
             show_markers=mktc,
             line_width=lw_ztc,
             marker_size=ms_ztc,
+            legend_in_plot=False,
         )
         fig_pk_zone_temp = plot_zone_single_plotly(
             pk_zone_temp,
@@ -4189,17 +5052,125 @@ with tab3:
             show_markers=mktp,
             line_width=lw_ztp,
             marker_size=ms_ztp,
+            legend_in_plot=False,
         )
-        apply_plotly_style(fig_cave_zone_temp, _style_from_prefix("zt_cave"))
-        apply_plotly_style(fig_pk_zone_temp, _style_from_prefix("zt_pk"))
-        show_plotly_chart(fig_cave_zone_temp, stage_defs, show_stage_legend=False)
-        show_plotly_chart(fig_pk_zone_temp, stage_defs)
+        apply_plotly_style(fig_cave_zone_temp, {**_style_from_prefix("zt_cave"), "show_legend": False})
+        apply_plotly_style(fig_pk_zone_temp, {**_style_from_prefix("zt_pk"), "show_legend": False})
+        show_plotly_chart(
+            fig_cave_zone_temp, stage_defs, show_stage_legend=False,
+            external_series_legend=True, series_legend_title="CAVE walls",
+        )
+        show_plotly_chart(
+            fig_pk_zone_temp, stage_defs,
+            external_series_legend=True, series_legend_title="PK zones (by wall)",
+        )
 
     st.write("**CAVE zone temperature preview**")
     st.dataframe(cave_zone_temp.head(20), use_container_width=True)
 
     st.write("**PK zone temperature preview**")
     st.dataframe(pk_zone_temp.head(20), use_container_width=True)
+
+with tab9:
+    st.subheader("PK — Rooms by floor plan (sensor-level CO₂)")
+    st.write(
+        "Every individual CO₂ sensor in a room, plotted on its own (not the zone mean) — laid out "
+        "around the real floor plan, matching each room's actual position on it."
+    )
+
+    if len(df_pk) == 0:
+        st.info("No PK data in the current upload.")
+    else:
+        pk_cat_fp = pk_cat if "pk_cat" in dir() else sensor_catalog(df_pk)
+        pk_cat_fp = pk_cat_fp.copy()
+        pk_cat_fp["room_group"] = pk_cat_fp["wall"].apply(_pk_room_group)
+
+        floor_choice = st.radio(
+            "Floor", options=["FF — upper floor", "GF — ground floor"],
+            horizontal=True, key="pkfp__floor",
+        )
+        floor_key = "FF" if floor_choice.startswith("FF") else "GF"
+        floor_columns = PK_FLOORPLAN_LAYOUT[floor_key]
+        fp_img_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "assets", "floorplans", PK_FLOORPLAN_IMAGES[floor_key]
+        )
+
+        with st.expander("Plot options (applies to every room on this floor)", expanded=False):
+            st.markdown("**X-axis (time)**")
+            render_x_mode_widgets("pkfp", t0, t1, stage_defs)
+            st.checkbox("Use fixed y-limits (all rooms)", key="pkfp__use_fixed_y", value=False)
+            c1, c2 = st.columns(2)
+            with c1:
+                st.number_input("Y min", key="pkfp__y_min", value=350.0)
+            with c2:
+                st.number_input("Y max", key="pkfp__y_max", value=2000.0)
+
+        x0_fp, x1_fp = render_x_controls("pkfp", t0, t1, stage_defs)
+        use_fy_fp = bool(st.session_state.get("pkfp__use_fixed_y", False))
+        y_range_fp = None
+        if use_fy_fp:
+            y_range_fp = (
+                float(st.session_state.get("pkfp__y_min", 350.0)),
+                float(st.session_state.get("pkfp__y_max", 2000.0)),
+            )
+
+        if stage_defs:
+            render_stage_legend_outside(stage_defs)
+
+        def _render_room_chart(room: str) -> None:
+            sensor_ids = sorted(
+                pk_cat_fp.loc[pk_cat_fp["room_group"] == room, "sensor_number"].astype(int).tolist()
+            )
+            if not sensor_ids:
+                st.info(f"**{room}**: no sensors found.")
+                return
+            ts_room = sensor_co2_timeseries(
+                df_pk, sensor_ids, cfg.align_to, catalog=pk_cat_fp, label_fn=_room_sensor_label,
+            )
+            if len(ts_room) == 0:
+                st.info(f"**{room}**: no data in range.")
+                return
+            fig_room = plot_room_sensors_matplotlib(
+                ts_room, room, stage_defs, x0_fp, x1_fp, y_range=y_range_fp,
+            )
+            # Every column is the same width (see PK_FLOORPLAN_LAYOUT) and
+            # every room chart uses the same figsize, so stretching to fill
+            # the column renders all rooms at the same final size.
+            st.pyplot(fig_room, use_container_width=True)
+            plt.close(fig_room)
+
+        cols = st.columns([c["width"] for c in floor_columns])
+        for col_widget, col_spec in zip(cols, floor_columns):
+            # A column shared with the floor plan (e.g. FF's middle column,
+            # width 1.4663) is wider than a plain room column (width 1.0).
+            # use_container_width=True would stretch that column's room
+            # charts (FF03/FF05) to the full, wider column — larger than
+            # every other room. Nest matching narrow sub-columns, mirroring
+            # the download composite's subgridspec margin trick, so a room
+            # chart here renders at the same width as any other room.
+            col_w = col_spec["width"]
+            margin = (col_w - PK_FLOORPLAN_ROOM_WIDTH) / 2
+            needs_margin = margin > 1e-6
+            with col_widget:
+                for item in col_spec["items"]:
+                    if item == "__GAP__":
+                        # Blank spacer, export-composite-only (keeps rooms
+                        # in the same column from crowding each other and
+                        # the floor plan there) — nothing to render on
+                        # screen, where Streamlit just stacks content with
+                        # its own natural spacing.
+                        continue
+                    if item == "__FLOORPLAN__":
+                        if os.path.exists(fp_img_path):
+                            st.image(fp_img_path, use_container_width=True)
+                        else:
+                            st.warning(f"Floor plan image not found at `{fp_img_path}`.")
+                    elif needs_margin:
+                        _, room_sub, _ = st.columns([margin, PK_FLOORPLAN_ROOM_WIDTH, margin])
+                        with room_sub:
+                            _render_room_chart(item)
+                    else:
+                        _render_room_chart(item)
 
 with tab4:
     st.subheader("Sensor CO₂ & temperature compare")
@@ -4828,6 +5799,12 @@ with tab5:
             _render_rh_sensor_block("PK", df_pk, pk_rh_cat, "rhscmp_pk", tuple(pk_zones_auto) if pk_zones_auto else ())
 
 with tab6:
+    # Set once the profile data + per-panel x/y ranges are actually computed
+    # below — the Export tab reads this rather than the profile variables
+    # directly, since they're only assigned inside the "stage selected and
+    # windows valid" branch further down (same script run, so plain globals
+    # are visible there, but only once that branch has actually executed).
+    vertical_profiles_ready = False
     st.subheader("Vertical Profiles (Decay)")
     st.write(
         "Select a **stage** from the experiment log. That stage’s start–end time is divided into **5 equal sub-windows**; "
@@ -4884,7 +5861,7 @@ with tab6:
             else:
                 labels = []
                 for i, (a, b) in enumerate(windows, start=1):
-                    labels.append((f"W{i}", a, b))
+                    labels.append((f"W{i}", a, b, i == len(windows)))
 
                 _win_tbl = pd.DataFrame(
                     [
@@ -4892,18 +5869,22 @@ with tab6:
                             "Legend": lab,
                             "Window": f"{i} of 5",
                             "Start (inclusive)": pd.Timestamp(a),
-                            "End (inclusive)": pd.Timestamp(b),
+                            "End": f"{pd.Timestamp(b)}" + (" (inclusive)" if last else " (exclusive)"),
                         }
-                        for i, (lab, a, b) in enumerate(labels, start=1)
+                        for i, (lab, a, b, last) in enumerate(labels, start=1)
                     ]
                 )
-                st.write("**Time windows for W1–W5** (each line on the plots uses only data in that interval)")
+                st.write(
+                    "**Time windows for W1–W5** (each line on the plots uses only data in that interval; "
+                    "windows are back-to-back, so each window's end is exclusive except the final one — "
+                    "a reading exactly on a boundary is never double-counted)"
+                )
                 st.dataframe(_win_tbl, use_container_width=True, hide_index=True)
 
-                pk_co2_profiles = [(lab, vertical_profile_means(df_pk, a, b, "co2")) for (lab, a, b) in labels]
-                cave_co2_profiles = [(lab, vertical_profile_means(df_cave, a, b, "co2")) for (lab, a, b) in labels]
-                pk_T_profiles = [(lab, vertical_profile_means(df_pk, a, b, "temperature")) for (lab, a, b) in labels]
-                cave_T_profiles = [(lab, vertical_profile_means(df_cave, a, b, "temperature")) for (lab, a, b) in labels]
+                pk_co2_profiles = [(lab, vertical_profile_means(df_pk, a, b, "co2", inclusive_end=last)) for (lab, a, b, last) in labels]
+                cave_co2_profiles = [(lab, vertical_profile_means(df_cave, a, b, "co2", inclusive_end=last)) for (lab, a, b, last) in labels]
+                pk_T_profiles = [(lab, vertical_profile_means(df_pk, a, b, "temperature", inclusive_end=last)) for (lab, a, b, last) in labels]
+                cave_T_profiles = [(lab, vertical_profile_means(df_cave, a, b, "temperature", inclusive_end=last)) for (lab, a, b, last) in labels]
 
                 _co2_parts = [dfp[["mean"]] for _, dfp in (cave_co2_profiles + pk_co2_profiles) if dfp is not None and len(dfp)]
                 co2_all = (
@@ -4912,12 +5893,19 @@ with tab6:
                 _t_parts = [dfp[["mean"]] for _, dfp in (cave_T_profiles + pk_T_profiles) if dfp is not None and len(dfp)]
                 t_all = pd.concat(_t_parts, axis=0, ignore_index=True) if _t_parts else pd.DataFrame({"mean": []})
 
-                # Built-in suggested defaults for profile panels (user can override and save per-panel).
-                # These are used as the default manual x-limits and fixed z extents.
-                co2_min_default = 350.0
-                co2_max_default = 1190.0
-                t_min_default = 10.5
-                t_max_default = 32.0
+                # Suggested defaults for profile panels (user can still override
+                # and save per-panel). The value-axis (x) range is computed from
+                # this stage's *actual* CAVE+PK data — not a hardcoded guess —
+                # so a high release never gets silently clipped off the chart
+                # (the old fixed 350-1190 for CO2 did exactly that here: real
+                # PK profile means reach ~1960 ppm in the later windows). Using
+                # the *combined* CAVE+PK range for both regions' panels (rather
+                # than auto-fitting each independently) also means CAVE and PK
+                # start on the same x-scale, so the two are directly comparable.
+                _co2_auto = _auto_ylim(co2_all["mean"]) if len(co2_all) else None
+                co2_min_default, co2_max_default = _co2_auto or (350.0, 1190.0)
+                _t_auto = _auto_ylim(t_all["mean"]) if len(t_all) else None
+                t_min_default, t_max_default = _t_auto or (10.5, 32.0)
                 z_min_default = 0.5
                 z_max_default = 10.5
 
@@ -5040,6 +6028,7 @@ with tab6:
                 leg_ct = _legend_fs_from_prefix("prof_ct")
                 leg_pc = _legend_fs_from_prefix("prof_pc")
                 leg_pt = _legend_fs_from_prefix("prof_pt")
+                vertical_profiles_ready = True
 
                 c1, c2, c3, c4 = st.columns(4)
 
@@ -5161,7 +6150,7 @@ with tab6:
                 st.write("---")
                 st.write("**Download profile data**")
                 rows = []
-                for win_idx, (win_label, a, b) in enumerate(labels, start=1):
+                for win_idx, (win_label, a, b, _last) in enumerate(labels, start=1):
                     for region, var, plist in [
                         ("CAVE", "co2", cave_co2_profiles),
                         ("CAVE", "temperature", cave_T_profiles),
@@ -5891,6 +6880,12 @@ with tab7:
 with tab8:
     st.subheader("Export")
 
+    exp_date = _data_date_prefix(df)
+    st.caption(
+        f"Filenames below start with the experiment's own data date (**{exp_date}**), "
+        "not today's date — so files stay identifiable regardless of when you download them."
+    )
+
     st.write("**Summary table**")
     st.dataframe(summary_df, use_container_width=True)
 
@@ -5898,7 +6893,7 @@ with tab8:
     st.download_button(
         label="Download summary CSV",
         data=csv_bytes,
-        file_name=f"{cfg.exp_code}_summary.csv",
+        file_name=f"{exp_date}_summary.csv",
         mime="text/csv",
     )
 
@@ -5980,58 +6975,245 @@ with tab8:
         )
 
     st.markdown("---")
-    st.write("**Download figures (PNG)**")
+    st.write("**Download figures**")
     with st.expander("Figures", expanded=False):
-        st.caption("Matplotlib-rendered PNGs. Interactive Plotly charts are on the other tabs.")
-
-        # Overall metrics
-        buf_overall_png = io.BytesIO()
-        fig_overall.savefig(buf_overall_png, format="png", bbox_inches="tight")
-        buf_overall_png.seek(0)
-        st.download_button(
-            label="Download overall metrics (PNG)",
-            data=buf_overall_png,
-            file_name=f"{cfg.exp_code}_overall_metrics.png",
-            mime="image/png",
+        st.caption(
+            "Report-ready versions of the charts: no title (so they drop straight into a PPT slide "
+            "with your own caption), full legend placed outside the plot so it's never cropped or "
+            "overlapping data, and y-axis limits auto-fit to this experiment's data (ratios like "
+            "Mixing Index / R² / Coverage / RH / CV keep their fixed 0–1 or 0–100 scale). "
+            "PNG for quick use, SVG if you want a lossless vector version you can still edit or "
+            "scale up without pixelating."
         )
 
+        # A placeholder written into further down, once every figure below
+        # has actually been built — Streamlit renders whatever a container
+        # holds at its *position* in the layout, not the order it was filled,
+        # so this "download everything" row can sit above the individual
+        # figures even though the ZIPs themselves aren't assembled until
+        # after the last one (PK Rooms) is generated at the bottom.
+        download_all_slot = st.container()
         st.markdown("---")
 
-        # Zone CO2
-        buf_zone_png = io.BytesIO()
-        fig_zone.savefig(buf_zone_png, format="png", bbox_inches="tight")
-        buf_zone_png.seek(0)
-        st.download_button(
-            label="Download zone CO₂ (PNG)",
-            data=buf_zone_png,
-            file_name=f"{cfg.exp_code}_zone_co2.png",
-            mime="image/png",
-        )
+        # (keyword, png_bytes, svg_bytes) for every figure below — collected
+        # here so "download everything" doesn't need to re-render any figure,
+        # just re-package the same bytes already handed to each individual
+        # download button.
+        _export_figs: List[Tuple[str, bytes, bytes]] = []
 
-        st.markdown("---")
+        def _download_row(fig, keyword: str, label: str):
+            png_buf = io.BytesIO()
+            fig.savefig(png_buf, format="png", bbox_inches="tight", dpi=200)
+            png_buf.seek(0)
+            svg_buf = io.BytesIO()
+            fig.savefig(svg_buf, format="svg", bbox_inches="tight")
+            svg_buf.seek(0)
+            png_bytes, svg_bytes = png_buf.getvalue(), svg_buf.getvalue()
+            _export_figs.append((keyword, png_bytes, svg_bytes))
+            c1, c2 = st.columns(2)
+            with c1:
+                st.download_button(
+                    label=f"Download {label} (PNG)",
+                    data=png_bytes,
+                    file_name=f"{exp_date}_{keyword}.png",
+                    mime="image/png",
+                    key=f"dl_{keyword}_png",
+                )
+            with c2:
+                st.download_button(
+                    label=f"Download {label} (SVG, vector)",
+                    data=svg_bytes,
+                    file_name=f"{exp_date}_{keyword}.svg",
+                    mime="image/svg+xml",
+                    key=f"dl_{keyword}_svg",
+                )
 
-        # Zone temperature
-        buf_zoneT_png = io.BytesIO()
-        fig_zone_T.savefig(buf_zoneT_png, format="png", bbox_inches="tight")
-        buf_zoneT_png.seek(0)
-        st.download_button(
-            label="Download zone temperature (PNG)",
-            data=buf_zoneT_png,
-            file_name=f"{cfg.exp_code}_zone_temperature.png",
-            mime="image/png",
-        )
+        # Mirror each chart's own interactive "Plot options" state (x-axis
+        # window, fixed/auto y-limits) so the downloaded figure matches
+        # whatever you're currently looking at on screen — these helpers
+        # only *read* session_state (the widgets themselves were already
+        # created when that tab's code ran above), so calling them again
+        # here is safe and doesn't touch the UI.
+        x0_ov, x1_ov = render_x_controls("overall", t0, t1, stage_defs)
+        y_merged_ov = _collect_ylims_from_prefix("overall", OVERALL_Y_KEYS, default_ylims())
+        use_fy_ov = bool(st.session_state.get("overall__use_fixed_y", True))
 
-        if fig_mfc is not None:
-            st.markdown("---")
-            buf_mfc_png = io.BytesIO()
-            fig_mfc.savefig(buf_mfc_png, format="png", bbox_inches="tight")
-            buf_mfc_png.seek(0)
-            st.download_button(
-                label="Download MFC quicklook (PNG)",
-                data=buf_mfc_png,
-                file_name=f"{cfg.exp_code}_mfc.png",
-                mime="image/png",
+        xa_c_exp, xa_c1_exp = render_x_controls("zco2_cave", t0, t1, stage_defs)
+        uy_c_exp = bool(st.session_state.get("zco2_cave__use_fixed_y", True))
+        uy_p_exp = bool(st.session_state.get("zco2_pk__use_fixed_y", True))
+        ylo_c_exp, yhi_c_exp = _y_pair_from_prefix("zco2_cave", cfg.ylims["zone_cave_co2"][0], cfg.ylims["zone_cave_co2"][1])
+        ylo_p_exp, yhi_p_exp = _y_pair_from_prefix("zco2_pk", cfg.ylims["zone_pk_co2"][0], cfg.ylims["zone_pk_co2"][1])
+        y_rc_exp = (ylo_c_exp, yhi_c_exp) if uy_c_exp else None
+        y_rp_exp = (ylo_p_exp, yhi_p_exp) if uy_p_exp else None
+
+        xtc0_exp, xtc1_exp = render_x_controls("zt_cave", t0, t1, stage_defs)
+        uy_tc_exp = bool(st.session_state.get("zt_cave__use_fixed_y", False))
+        uy_tp_exp = bool(st.session_state.get("zt_pk__use_fixed_y", False))
+        ytc_lo_exp, ytc_hi_exp = _y_pair_from_prefix("zt_cave", 8.0, 30.0)
+        ytp_lo_exp, ytp_hi_exp = _y_pair_from_prefix("zt_pk", 8.0, 30.0)
+        y_rtc_exp = (ytc_lo_exp, ytc_hi_exp) if uy_tc_exp else None
+        y_rtp_exp = (ytp_lo_exp, ytp_hi_exp) if uy_tp_exp else None
+
+        lock_rx_exp = bool(st.session_state.get("mfc__lock_x_release", True))
+        if lock_rx_exp:
+            xs_exp, xe_exp = t_rel0, t_rel1
+        else:
+            xs_exp, xe_exp = render_x_controls("mfc", t0, t1, stage_defs)
+        y_r_exp = None
+        if mfc_df is not None and st.session_state.get("mfc__use_custom_y", False):
+            f_hi_exp = float(mfc_df["F"].max()) if len(mfc_df) else 1.0
+            y_r_exp = _y_pair_from_prefix("mfc", 0.0, max(1.0, f_hi_exp * 1.08))
+
+        # Larger, publication-style fonts for exported figures only — scoped
+        # with rc_context so it never leaks into other charts or sessions.
+        with plt.rc_context(_publication_rc_dict(16.0)):
+            fig_overall_export = plot_overall_metrics(
+                co2_cave, co2_pk, temp_cave, temp_pk, deltaT_pk_minus_cave,
+                stage_defs, cfg, x0_ov, x1_ov,
+                line_width=lw_overall, legend_fontsize=leg_overall, export_mode=True,
+                y_overrides=y_merged_ov, use_fixed_y=use_fy_ov,
             )
+            _download_row(fig_overall_export, "overall_metrics", "overall metrics")
+
+            st.markdown("---")
+
+            fig_zone_export = plot_zone_co2(
+                cave_zone_co2, pk_zone_co2, stage_defs, cfg, xa_c_exp, xa_c1_exp,
+                cave_line_width=lw_zc * 1.25, pk_line_width=lw_zp * 1.0,
+                cave_legend_fs=leg_zc, pk_legend_fs=leg_zp, export_mode=True,
+                cave_y_range=y_rc_exp, pk_y_range=y_rp_exp,
+            )
+            _download_row(fig_zone_export, "zone_co2", "zone CO₂")
+
+            st.markdown("---")
+
+            fig_zone_T_export = plot_zone_temp(
+                cave_zone_temp, pk_zone_temp, stage_defs, cfg, xtc0_exp, xtc1_exp,
+                cave_line_width=lw_tc * 1.25, pk_line_width=lw_tp * 1.0,
+                cave_legend_fs=leg_tc, pk_legend_fs=leg_tp, export_mode=True,
+                cave_y_range=y_rtc_exp, pk_y_range=y_rtp_exp,
+            )
+            _download_row(fig_zone_T_export, "zone_temperature", "zone temperature")
+
+            if mfc_df is not None:
+                st.markdown("---")
+                fig_mfc_export = plot_mfc(
+                    mfc_df, t_on, t_off, t_rel0, t_rel1, cfg,
+                    line_width=lw_mfc, legend_fontsize=leg_mfc, export_mode=True,
+                    x_range=(xs_exp, xe_exp), y_range=y_r_exp,
+                )
+                _download_row(fig_mfc_export, "mfc_quicklook", "MFC quicklook")
+
+            if has_rh_data and rh_cave is not None and rh_pk is not None:
+                st.markdown("---")
+                x0_rh_exp, x1_rh_exp = render_x_controls("rh_ov", t0, t1, stage_defs)
+                y_merged_rh_exp = _collect_ylims_from_prefix("rh_ov", RH_OVERVIEW_Y_KEYS, default_ylims())
+                use_fy_rh_exp = bool(st.session_state.get("rh_ov__use_fixed_y", True))
+                mean_yr_exp = y_merged_rh_exp["rh_mean"] if use_fy_rh_exp else None
+                std_yr_exp = y_merged_rh_exp["rh_std"] if use_fy_rh_exp else None
+                fig_rh_export = plot_humidity_export(
+                    rh_cave, rh_pk, stage_defs, cfg, x0_rh_exp, x1_rh_exp,
+                    mean_y_range=mean_yr_exp, std_y_range=std_yr_exp,
+                )
+                _download_row(fig_rh_export, "humidity_overview", "humidity overview")
+
+            if vertical_profiles_ready:
+                st.markdown("---")
+                _prof_stage_slug = re.sub(r"[^A-Za-z0-9]+", "_", str(stage_name)).strip("_")
+
+                fig_vp_co2_export = plot_vertical_profiles_export(
+                    cave_co2_profiles, pk_co2_profiles, "Mean CO₂ (ppm)",
+                    co2_xrange_c, co2_xrange_p, yz_cc, yz_pc,
+                    line_width=max(lw_cc, lw_pc),
+                )
+                _download_row(
+                    fig_vp_co2_export, f"vertical_profile_co2_{_prof_stage_slug}",
+                    f"vertical profile CO₂ ({stage_name})",
+                )
+
+                st.markdown("---")
+
+                fig_vp_temp_export = plot_vertical_profiles_export(
+                    cave_T_profiles, pk_T_profiles, "Mean Temperature (°C)",
+                    t_xrange_c, t_xrange_p, yz_ct, yz_pt,
+                    line_width=max(lw_ct, lw_pt),
+                )
+                _download_row(
+                    fig_vp_temp_export, f"vertical_profile_temperature_{_prof_stage_slug}",
+                    f"vertical profile temperature ({stage_name})",
+                )
+
+            if len(df_pk) > 0:
+                st.markdown("---")
+                # Same fixed template as the on-screen PK Rooms tab (one
+                # composite image per floor: every room's sensor-level CO2
+                # panel plus the real floor plan), mirroring that tab's own
+                # x-window / y-limit widget state ("pkfp" prefix) — this
+                # only *reads* session_state, so calling it again here is
+                # safe (its widgets were already created when that tab ran).
+                pk_cat_exp = pk_cat if "pk_cat" in dir() else sensor_catalog(df_pk)
+                pk_cat_exp = pk_cat_exp.copy()
+                pk_cat_exp["room_group"] = pk_cat_exp["wall"].apply(_pk_room_group)
+
+                x0_pkfp_exp, x1_pkfp_exp = render_x_controls("pkfp", t0, t1, stage_defs)
+                use_fy_pkfp_exp = bool(st.session_state.get("pkfp__use_fixed_y", False))
+                y_range_pkfp_exp = None
+                if use_fy_pkfp_exp:
+                    y_range_pkfp_exp = (
+                        float(st.session_state.get("pkfp__y_min", 350.0)),
+                        float(st.session_state.get("pkfp__y_max", 2000.0)),
+                    )
+
+                for floor_key_exp, floor_label_exp in [("FF", "upper floor"), ("GF", "ground floor")]:
+                    fp_img_path_exp = os.path.join(
+                        os.path.dirname(os.path.abspath(__file__)), "assets", "floorplans",
+                        PK_FLOORPLAN_IMAGES[floor_key_exp],
+                    )
+                    fig_pkrooms_exp = plot_pk_floorplan_export(
+                        floor_key_exp, pk_cat_exp, df_pk, cfg.align_to, stage_defs,
+                        x0_pkfp_exp, x1_pkfp_exp, fp_img_path_exp, y_range=y_range_pkfp_exp,
+                    )
+                    _download_row(
+                        fig_pkrooms_exp, f"pk_rooms_{floor_key_exp.lower()}",
+                        f"PK rooms — {floor_label_exp}",
+                    )
+                    st.markdown("---")
+
+        # Now that every figure above has been built and its PNG/SVG bytes
+        # collected, fill in the placeholder reserved at the top of this
+        # expander with one-click "everything at once" downloads.
+        if _export_figs:
+            zip_png_buf = io.BytesIO()
+            with zipfile.ZipFile(zip_png_buf, "w", zipfile.ZIP_DEFLATED) as zf:
+                for keyword, png_bytes, _svg_bytes in _export_figs:
+                    zf.writestr(f"{exp_date}_{keyword}.png", png_bytes)
+            zip_png_buf.seek(0)
+
+            zip_svg_buf = io.BytesIO()
+            with zipfile.ZipFile(zip_svg_buf, "w", zipfile.ZIP_DEFLATED) as zf:
+                for keyword, _png_bytes, svg_bytes in _export_figs:
+                    zf.writestr(f"{exp_date}_{keyword}.svg", svg_bytes)
+            zip_svg_buf.seek(0)
+
+            with download_all_slot:
+                st.write(f"**Download all {len(_export_figs)} figures at once**")
+                ca1, ca2 = st.columns(2)
+                with ca1:
+                    st.download_button(
+                        label="⬇️ Download ALL figures (ZIP of PNGs)",
+                        data=zip_png_buf,
+                        file_name=f"{exp_date}_all_figures_png.zip",
+                        mime="application/zip",
+                        key="dl_all_png_zip",
+                    )
+                with ca2:
+                    st.download_button(
+                        label="⬇️ Download ALL figures (ZIP of SVGs, vector)",
+                        data=zip_svg_buf,
+                        file_name=f"{exp_date}_all_figures_svg.zip",
+                        mime="application/zip",
+                        key="dl_all_svg_zip",
+                    )
 
 # If we forced defaults due to a new upload, clear the flag after widgets have been created.
 if st.session_state.get("__force_defaults_from_upload", False):
