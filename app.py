@@ -5610,10 +5610,14 @@ with tab_ae:
                 if np.isfinite(res_int["lam_h"]) and res_int["lam_h"] <= 0:
                     st.error(
                         f"λ came out **non-positive ({res_int['lam_h']:.4f} 1/h)**, which is "
-                        "unphysical. Check these in order:\n\n"
+                        "unphysical. **The fitting window is the most likely cause** — set "
+                        "**Window → Manual** above and place the start by hand, then check these "
+                        "in order:\n\n"
                         f"1. **Does the window include a stage where {solve_label} had its own "
                         f"source?** The model assumes {solve_label} is only fed by exchange. If the "
-                        "release went into it, the release stage must be excluded — fit the decay.\n"
+                        f"release went into {solve_label}, the release stage has to be excluded: "
+                        "drag the start to where the decay actually begins. Logged stage boundaries "
+                        "are nominal and often sit minutes away from it.\n"
                         f"2. **Is t₀ in the right place?** The fit is anchored at "
                         f"y = {solve_label}\\_ex(t) − {solve_label}\\_ex(t₀) and forced through the "
                         "origin, so starting before the zone was loaded makes y keep one sign while "
