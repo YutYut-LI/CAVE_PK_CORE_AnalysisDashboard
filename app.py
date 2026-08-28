@@ -2580,8 +2580,8 @@ def plot_vertical_profiles_export(
 
 def plot_io_ratio(io_ex, infiltration_factor, t_rel0, t_rel1, t_base0, t_base1, ex_thresh, cfg: AppConfig,
                   *, src_label: str = "CAVE", rcv_label: str = "PK",
-                  window_label: str = "Release window"):
-    fig, ax = plt.subplots(figsize=(14, 5))
+                  window_label: str = "Release window", export_mode: bool = False):
+    fig, ax = plt.subplots(figsize=(12, 5) if export_mode else (14, 5))
     ax.plot(io_ex.index, io_ex.values, linewidth=2.0,
             label=f"ratio(t) = {rcv_label}_ex / {src_label}_ex (thresholded)")
     ax.axvspan(t_rel0, t_rel1, alpha=0.15, label=window_label)
@@ -2592,10 +2592,13 @@ def plot_io_ratio(io_ex, infiltration_factor, t_rel0, t_rel1, t_base0, t_base1, 
     ax.axvspan(t_base0, t_base1, alpha=0.08, label="Baseline window")
     ax.text(0.01, 0.02, f"Threshold: {src_label}_ex > {ex_thresh:.1f} ppm", transform=ax.transAxes, fontsize=9, va="bottom", ha="left")
 
-    ax.set_title(f"{cfg.exp_code} — Excess transfer ratio ({src_label} → {rcv_label})", fontsize=12, fontweight="bold")
-    ax.set_ylabel("Transfer ratio (-)", fontsize=12, fontweight="bold")
-    ax.set_xlabel("Time", fontsize=12, fontweight="bold")
-    ax.grid(True)
+    if not export_mode:
+        ax.set_title(f"{cfg.exp_code} — Excess transfer ratio ({src_label} → {rcv_label})", fontsize=12, fontweight="bold")
+    _fs = 16 if export_mode else 12
+    ax.set_ylabel("Transfer ratio (-)", fontsize=_fs, fontweight="bold")
+    ax.set_xlabel("Time", fontsize=_fs, fontweight="bold")
+    ax.grid(True, color="0.85", linewidth=0.6)
+    ax.set_axisbelow(True)
     ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
     ax.set_xlim(t_rel0, t_rel1)
 
@@ -2603,14 +2606,19 @@ def plot_io_ratio(io_ex, infiltration_factor, t_rel0, t_rel1, t_base0, t_base1, 
         ax.set_ylim(*cfg.ylims["io_ex"])
 
     plt.xticks(rotation=45)
-    ax.legend(frameon=True, fontsize=10, loc="upper left")
-    plt.tight_layout()
+    if export_mode:
+        plt.tight_layout()
+        h, l = ax.get_legend_handles_labels()
+        _export_figlegend(fig, h, l, where="bottom", fontsize=13, anchor_ax=ax)
+    else:
+        ax.legend(frameon=True, fontsize=10, loc="upper left")
+        plt.tight_layout()
     return fig
 
 
 def plot_scatter(df_sc, slope, intercept, r2, cfg: AppConfig,
-                 *, src_label: str = "CAVE", rcv_label: str = "PK"):
-    fig, ax = plt.subplots(figsize=(6.5, 5.5))
+                 *, src_label: str = "CAVE", rcv_label: str = "PK", export_mode: bool = False):
+    fig, ax = plt.subplots(figsize=(8.0, 6.5) if export_mode else (6.5, 5.5))
     ax.scatter(df_sc["cave_ex"].values, df_sc["pk_ex"].values, s=25, alpha=0.8, label="Release points (thresholded)")
 
     if np.isfinite(slope):
@@ -2618,17 +2626,25 @@ def plot_scatter(df_sc, slope, intercept, r2, cfg: AppConfig,
         yline = intercept + slope * xline
         ax.plot(xline, yline, linewidth=2.0, linestyle="--", label=f"Fit: slope={slope:.3f}, R²={r2:.3f}")
 
-    ax.set_title(f"{cfg.exp_code} — {rcv_label}_ex vs {src_label}_ex (Release only)", fontsize=12, fontweight="bold")
-    ax.set_xlabel(f"{src_label}_ex (ppm)", fontsize=12, fontweight="bold")
-    ax.set_ylabel(f"{rcv_label}_ex (ppm)", fontsize=12, fontweight="bold")
-    ax.grid(True)
-    ax.legend(frameon=True, fontsize=9, loc="upper left")
+    if not export_mode:
+        ax.set_title(f"{cfg.exp_code} — {rcv_label}_ex vs {src_label}_ex (Release only)", fontsize=12, fontweight="bold")
+    _fs = 16 if export_mode else 12
+    ax.set_xlabel(f"{src_label}_ex (ppm)", fontsize=_fs, fontweight="bold")
+    ax.set_ylabel(f"{rcv_label}_ex (ppm)", fontsize=_fs, fontweight="bold")
+    ax.grid(True, color="0.85", linewidth=0.6)
+    ax.set_axisbelow(True)
 
-    if cfg.use_fixed_ylims:
+    if cfg.use_fixed_ylims and not export_mode:
         ax.set_xlim(*cfg.ylims["scatter_cave_ex"])
         ax.set_ylim(*cfg.ylims["scatter_pk_ex"])
 
-    plt.tight_layout()
+    if export_mode:
+        plt.tight_layout()
+        h, l = ax.get_legend_handles_labels()
+        _export_figlegend(fig, h, l, where="bottom", fontsize=13, anchor_ax=ax)
+    else:
+        ax.legend(frameon=True, fontsize=9, loc="upper left")
+        plt.tight_layout()
     return fig
 
 
@@ -3651,50 +3667,70 @@ def plot_lambda_window_plotly(res, cfg: AppConfig, src_label: str, rcv_label: st
     return fig
 
 
-def plot_lambda_panel_matplotlib(res_int, res_full, res_win, cfg: AppConfig,
-                                 src_label: str, rcv_label: str, win_min: int, step_min: int):
-    """Three-panel static version of the lambda figures (used for PNG export)."""
-    t_int, t_full, t_win = _lam_titles(cfg, src_label, rcv_label)
-    fig, axes = plt.subplots(1, 3, figsize=(19, 5.2))
+def _lam_export_axes(figsize=(9.0, 6.0)):
+    fig, ax = plt.subplots(figsize=figsize)
+    ax.grid(True, color="0.85", linewidth=0.6)
+    ax.set_axisbelow(True)
+    return fig, ax
 
-    ax = axes[0]
-    ax.plot(res_int["x"], res_int["y"], "o", ms=4, alpha=0.8, label="Data")
-    if np.isfinite(res_int["lam_h"]) and len(res_int["x"]):
-        xs = np.array([float(np.min(res_int["x"])), float(np.max(res_int["x"]))])
-        ax.plot(xs, (res_int["lam_h"] / 3600.0) * xs + res_int.get("intercept", 0.0), "-",
-                lw=2, label=f"λ={res_int['lam_h']:.3f} 1/h, R²={res_int['r2']:.3f}")
-    ax.set_title(t_int, fontsize=11, fontweight="bold")
-    ax.set_xlabel(f"∫({src_label}_ex − {rcv_label}_ex) dt [ppm·s]")
-    ax.set_ylabel(f"{rcv_label}_ex − {rcv_label}_ex(t₀) [ppm]")
 
-    ax = axes[1]
-    ax.plot(res_full["X"], res_full["Y"], "o", ms=4, alpha=0.6, label="Data")
-    if np.isfinite(res_full["lam_h"]) and len(res_full["X"]):
-        xs = np.array([float(np.min(res_full["X"])), float(np.max(res_full["X"]))])
-        ax.plot(xs, (res_full["lam_h"] / 3600.0) * xs, "-",
-                lw=2, label=f"λ={res_full['lam_h']:.3f} 1/h, R²={res_full['r2']:.3f}")
-    ax.set_title(t_full, fontsize=11, fontweight="bold")
-    ax.set_xlabel(f"{src_label}_ex − {rcv_label}_ex [ppm]")
-    ax.set_ylabel(f"d{rcv_label}_ex/dt [ppm/s]")
-
-    ax = axes[2]
-    ax.plot(res_win["times"], res_win["lam_h"], "-o", ms=4, lw=2, label="λ_window(t)")
-    if np.isfinite(res_win["mean_h"]):
-        ax.axhline(res_win["mean_h"], ls="--", lw=1.8, label=f"mean={res_win['mean_h']:.3f}")
-    if np.isfinite(res_win["median_h"]):
-        ax.axhline(res_win["median_h"], ls=":", lw=2.0, label=f"median={res_win['median_h']:.3f}")
-    ax.set_title(f"{t_win} | {win_min}/{step_min} min", fontsize=11, fontweight="bold")
-    ax.set_xlabel("Time")
-    ax.set_ylabel("λ_window (1/h)")
-    ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
-    for lab in ax.get_xticklabels():
-        lab.set_rotation(45)
-
-    for a in axes:
-        a.grid(True)
-        a.legend(frameon=True, fontsize=9, loc="best")
-
+def plot_lambda_integrated_export(res, cfg: AppConfig, other_label: str, solve_label: str):
+    """Report-ready integrated-method figure: no title, external legend."""
+    fs_axis = 16
+    fig, ax = _lam_export_axes()
+    ax.plot(res["x"], res["y"], "o", ms=5, alpha=0.85, label="Data")
+    if np.isfinite(res["lam_h"]) and len(res["x"]):
+        xs = np.array([float(np.min(res["x"])), float(np.max(res["x"]))])
+        ax.plot(xs, (res["lam_h"] / 3600.0) * xs + res.get("intercept", 0.0), "-", lw=2.2,
+                label=f"Fit: λ = {res['lam_h']:.3f} 1/h, R² = {res['r2']:.3f}")
+    ax.set_xlabel(f"∫({other_label}_ex − {solve_label}_ex) dt  [ppm·s]",
+                  fontsize=fs_axis, fontweight="bold")
+    ax.set_ylabel(f"{solve_label}_ex(t) − {solve_label}_ex(t₀)  [ppm]",
+                  fontsize=fs_axis, fontweight="bold")
     plt.tight_layout()
+    h, l = ax.get_legend_handles_labels()
+    _export_figlegend(fig, h, l, where="bottom", fontsize=13, anchor_ax=ax)
+    return fig
+
+
+def plot_lambda_regression_export(res, cfg: AppConfig, other_label: str, solve_label: str):
+    """Report-ready differential full-regression figure."""
+    fs_axis = 16
+    fig, ax = _lam_export_axes()
+    ax.plot(res["X"], res["Y"], "o", ms=5, alpha=0.65, label="Data")
+    if np.isfinite(res["lam_h"]) and len(res["X"]):
+        xs = np.array([float(np.min(res["X"])), float(np.max(res["X"]))])
+        ax.plot(xs, (res["lam_h"] / 3600.0) * xs, "-", lw=2.2,
+                label=f"Fit: λ = {res['lam_h']:.3f} 1/h, R² = {res['r2']:.3f}")
+    ax.set_xlabel(f"ΔC = {other_label}_ex − {solve_label}_ex  [ppm]",
+                  fontsize=fs_axis, fontweight="bold")
+    ax.set_ylabel(f"d{solve_label}_ex/dt  [ppm/s]", fontsize=fs_axis, fontweight="bold")
+    plt.tight_layout()
+    h, l = ax.get_legend_handles_labels()
+    _export_figlegend(fig, h, l, where="bottom", fontsize=13, anchor_ax=ax)
+    return fig
+
+
+def plot_lambda_window_export(res, cfg: AppConfig, other_label: str, solve_label: str,
+                              win_min: int, step_min: int, y_range=None):
+    """Report-ready sliding-window figure."""
+    fs_axis = 16
+    fig, ax = _lam_export_axes(figsize=(12.0, 5.0))
+    ax.plot(res["times"], res["lam_h"], "-o", ms=5, lw=2.2,
+            label=f"λ over a {win_min} min window, stepped {step_min} min")
+    if np.isfinite(res["mean_h"]):
+        ax.axhline(res["mean_h"], ls="--", lw=1.8, label=f"Mean = {res['mean_h']:.3f} 1/h")
+    if np.isfinite(res["median_h"]):
+        ax.axhline(res["median_h"], ls=":", lw=2.2, label=f"Median = {res['median_h']:.3f} 1/h")
+    ax.set_xlabel("Time", fontsize=fs_axis, fontweight="bold")
+    ax.set_ylabel(f"λ_{solve_label} (1/h)", fontsize=fs_axis, fontweight="bold")
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
+    plt.setp(ax.get_xticklabels(), rotation=45)
+    if y_range is not None:
+        ax.set_ylim(*y_range)
+    plt.tight_layout()
+    h, l = ax.get_legend_handles_labels()
+    _export_figlegend(fig, h, l, where="bottom", fontsize=13, anchor_ax=ax)
     return fig
 
 
@@ -6926,52 +6962,9 @@ with tab8:
             mime="text/csv",
         )
 
-        _buf_ae = io.BytesIO()
-        _fig_ae = plot_lambda_panel_matplotlib(
-            ae_export["res_int"], ae_export["res_full"], ae_export["res_win"],
-            cfg, _ae_other, _ae_solve, cfg.lam_win_min, cfg.lam_step_min,
-        )
-        _fig_ae.savefig(_buf_ae, format="png", dpi=200, bbox_inches="tight")
-        _buf_ae.seek(0)
-        plt.close(_fig_ae)
-        st.download_button(
-            label="Download λ figures (PNG)",
-            data=_buf_ae,
-            file_name=f"{cfg.exp_code}_air_exchange_lambda.png",
-            mime="image/png",
-        )
-
-        _buf_io = io.BytesIO()
-        _w0, _w1 = ae_export["tr_window"]
-        _fig_io = plot_io_ratio(
-            ae_export["tr"]["io_ex"], ae_export["tr"]["factor"], _w0, _w1,
-            ae["t_base0"], ae["t_base1"], ae_export["ex_thresh"], cfg,
-            src_label=_ae_src, rcv_label=_ae_rcv, window_label="Analysis window",
-        )
-        _fig_io.savefig(_buf_io, format="png", dpi=200, bbox_inches="tight")
-        _buf_io.seek(0)
-        plt.close(_fig_io)
-        st.download_button(
-            label="Download transfer ratio (PNG)",
-            data=_buf_io,
-            file_name=f"{cfg.exp_code}_transfer_ratio.png",
-            mime="image/png",
-        )
-
-        _buf_scp = io.BytesIO()
-        _sl, _ic_, _r2_ = ae_export["sc"]
-        _fig_scp = plot_scatter(
-            ae_export["df_sc"], _sl, _ic_, _r2_, cfg,
-            src_label=_ae_src, rcv_label=_ae_rcv,
-        )
-        _fig_scp.savefig(_buf_scp, format="png", dpi=200, bbox_inches="tight")
-        _buf_scp.seek(0)
-        plt.close(_fig_scp)
-        st.download_button(
-            label="Download excess scatter (PNG)",
-            data=_buf_scp,
-            file_name=f"{cfg.exp_code}_excess_scatter.png",
-            mime="image/png",
+        st.caption(
+            "The air-exchange figures themselves are in **Download figures** below, "
+            "alongside every other page's, in PNG and SVG and in the bundled ZIP."
         )
 
     st.markdown("---")
@@ -7178,6 +7171,50 @@ with tab8:
                         f"PK rooms — {floor_label_exp}",
                     )
                     st.markdown("---")
+
+        # ---- Air exchange (PK <-> CAVE) ----------------------------------
+        if ae_export is not None:
+            _ae_other, _ae_solve = ae_export["lam_labels"]
+            _ae_src, _ae_rcv = ae_export["labels"]
+            _w0, _w1 = ae_export["tr_window"]
+
+            _download_row(
+                plot_io_ratio(
+                    ae_export["tr"]["io_ex"], ae_export["tr"]["factor"], _w0, _w1,
+                    ae["t_base0"], ae["t_base1"], ae_export["ex_thresh"], cfg,
+                    src_label=_ae_src, rcv_label=_ae_rcv,
+                    window_label="Analysis window", export_mode=True,
+                ),
+                "transfer_ratio", "transfer ratio",
+            )
+            st.markdown("---")
+
+            _sl, _ic_, _r2_ = ae_export["sc"]
+            _download_row(
+                plot_scatter(ae_export["df_sc"], _sl, _ic_, _r2_, cfg,
+                             src_label=_ae_src, rcv_label=_ae_rcv, export_mode=True),
+                "excess_scatter", "excess scatter",
+            )
+            st.markdown("---")
+
+            _download_row(
+                plot_lambda_integrated_export(ae_export["res_int"], cfg, _ae_other, _ae_solve),
+                "lambda_integrated", f"λ integrated ({_ae_solve})",
+            )
+            st.markdown("---")
+
+            _download_row(
+                plot_lambda_regression_export(ae_export["res_full"], cfg, _ae_other, _ae_solve),
+                "lambda_regression", f"λ full regression ({_ae_solve})",
+            )
+            st.markdown("---")
+
+            _download_row(
+                plot_lambda_window_export(ae_export["res_win"], cfg, _ae_other, _ae_solve,
+                                          cfg.lam_win_min, cfg.lam_step_min),
+                "lambda_sliding_window", f"λ sliding window ({_ae_solve})",
+            )
+            st.markdown("---")
 
         # Now that every figure above has been built and its PNG/SVG bytes
         # collected, fill in the placeholder reserved at the top of this
