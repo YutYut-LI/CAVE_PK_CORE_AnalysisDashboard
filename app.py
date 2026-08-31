@@ -361,6 +361,27 @@ def parse_csv_or_excel(uploaded_file) -> pd.DataFrame:
 
 
 @st.cache_data(show_spinner=False)
+def _parse_timestamps(series: pd.Series) -> pd.Series:
+    """Parse a timestamp column that may be ISO (YYYY-MM-DD) or UK-style
+    (DD/MM/YYYY).
+
+    dayfirst=True is right for the UK-style logs but silently corrupts ISO
+    ones: pandas reads the second field of "2025-09-03" as the day and
+    returns 9 March. It only does so when the day of month is 12 or less -
+    above that the swapped month is invalid and parsing falls back to the
+    correct reading - so the damage lands on some experiments and not others,
+    which is what makes it easy to miss. Detect the layout instead of
+    assuming it.
+    """
+    if pd.api.types.is_datetime64_any_dtype(series):
+        return series
+    txt = series.astype(str).str.strip()
+    looks_iso = txt.str.match(r"^\d{4}-\d{2}-\d{2}").fillna(False)
+    if looks_iso.any() and looks_iso.mean() > 0.5:
+        return pd.to_datetime(series, errors="coerce")
+    return pd.to_datetime(series, errors="coerce", dayfirst=True)
+
+
 def load_explora_any(file_bytes: bytes, filename: str) -> pd.DataFrame:
     bio = io.BytesIO(file_bytes)
     if filename.lower().endswith(".csv"):
@@ -384,7 +405,7 @@ def load_explora_any(file_bytes: bytes, filename: str) -> pd.DataFrame:
         if r not in df.columns:
             raise ValueError(f"Explora missing '{r}'. Columns: {list(df.columns)}")
 
-    df["time"] = pd.to_datetime(df[time_col], errors="coerce", dayfirst=True)
+    df["time"] = _parse_timestamps(df[time_col])
     df["co2"] = pd.to_numeric(df["co2"], errors="coerce")
     df["temperature"] = pd.to_numeric(df["temperature"], errors="coerce")
     df["sensor_number"] = pd.to_numeric(df["sensor_number"], errors="coerce").astype("Int64")
@@ -567,8 +588,19 @@ def mfc_has_temperature(mfc_df: Optional[pd.DataFrame]) -> bool:
 
 @st.cache_data(show_spinner=False)
 def load_mfc_csv(file_bytes: bytes, filename: str) -> pd.DataFrame:
+    """MFC log from the release rig. Named ..._csv for historical reasons; the
+    rig usually writes CSV, but a workbook re-save is just as valid an input,
+    so both are accepted like the Explora loader does. The sheet is taken by
+    position — these exports name it after a run GUID, never anything fixed."""
     bio = io.BytesIO(file_bytes)
-    dfm = pd.read_csv(bio)
+    name = str(filename).lower()
+    if name.endswith((".xlsx", ".xlsm", ".xls")):
+        xl = pd.ExcelFile(bio)
+        if not xl.sheet_names:
+            raise ValueError(f"MFC workbook has no sheets: {filename}")
+        dfm = pd.read_excel(io.BytesIO(file_bytes), sheet_name=xl.sheet_names[0])
+    else:
+        dfm = pd.read_csv(bio)
     dfm.columns = [_clean_mfc_column_name(c) for c in dfm.columns]
 
     ts_col = _find_mfc_column(dfm.columns, "Timestamp", "Time", "DateTime", "Date time")
@@ -588,7 +620,7 @@ def load_mfc_csv(file_bytes: bytes, filename: str) -> pd.DataFrame:
     # on older MFC files that don't record temperature at all.
     temp_col = _detect_mfc_temperature_column(dfm.columns)
 
-    dfm["t"] = pd.to_datetime(dfm[ts_col], errors="coerce", dayfirst=True)
+    dfm["t"] = _parse_timestamps(dfm[ts_col])
     dfm["Fset"] = _parse_mfc_numeric_series(dfm[fset_col])
     dfm["Fmeas"] = _parse_mfc_numeric_series(dfm[fmeas_col])
     if temp_col is not None:
@@ -4282,7 +4314,7 @@ stage_file = st.sidebar.file_uploader(
 
 mfc_file = st.sidebar.file_uploader(
     "MFC file (optional)",
-    type=["csv"]
+    type=["csv", "xlsx", "xlsm", "xls"]
 )
 
 def _upload_signature(file_obj) -> str:
