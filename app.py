@@ -177,6 +177,21 @@ class AppConfig:
     ylims: Dict[str, Tuple[float, float]] = None
 
 
+def _detach(fig):
+    """Take a figure out of pyplot's global registry and hand it back.
+
+    plt.subplots() files every figure in that registry, which holds a
+    reference for the life of the process. Nothing here ever rendered through
+    the registry - Streamlit and savefig both work off the object - so the
+    only thing it did was stop finished figures from ever being freed, at
+    roughly 2 MB each across the ~40 this app draws per rerun. Closing severs
+    that link while leaving the figure fully usable: it can still be saved,
+    re-rendered and, for the cached builders, handed out again on a later hit.
+    """
+    plt.close(fig)
+    return fig
+
+
 def default_ylims():
     return {
         "co2_mean": (350, 1300),
@@ -1477,10 +1492,17 @@ def plot_room_sensors_matplotlib(
             bbox_to_anchor=(0.5, target_axes_frac),
             frameon=True, framealpha=0.9,
         )
-    return fig if standalone else ax
+    # Only the standalone figure is ours to detach; in the composite case the
+    # figure belongs to the caller, which detaches it when it is finished.
+    return _detach(fig) if standalone else ax
 
 
-@st.cache_resource(show_spinner=False)
+# st.cache_resource keeps entries for the life of the process and shares them
+# across every session, so an uncapped cache of matplotlib figures only ever
+# grows - each distinct combination of plot options adds a fresh set that is
+# never evicted. Cap them: a bounded LRU still serves the repeat renders that
+# make the second floor-plan tab affordable, without the unbounded tail.
+@st.cache_resource(show_spinner=False, max_entries=48)
 def plot_room_sensors_cached(
     ts_df: pd.DataFrame,
     room_label: str,
@@ -1502,7 +1524,7 @@ def plot_room_sensors_cached(
     )
 
 
-@st.cache_resource(show_spinner=False)
+@st.cache_resource(show_spinner=False, max_entries=6)
 def plot_pk_floorplan_export(
     floor_key: str,
     pk_cat: pd.DataFrame,
@@ -1669,7 +1691,7 @@ def plot_pk_floorplan_export(
                 value_label=value_label, unit=unit,
             )
 
-    return fig
+    return _detach(fig)
 
 
 def add_stage_shading(ax, stage_defs, stage_patches):
@@ -2010,7 +2032,7 @@ def plot_vertical_profiles_matplotlib(
     ax.set_yticklabels([f"z{i}" if i > 0 else "z0" for i in range(0, 11)])
     if show_legend:
         ax.legend(loc="best", fontsize=max(5, min(24, int(legend_fontsize))))
-    return fig
+    return _detach(fig)
 
 
 def plot_vertical_profiles_plotly(
@@ -2072,7 +2094,7 @@ def plot_vertical_profiles_plotly(
 # whole script on *every* widget interaction, anywhere on any tab. Caching
 # them means a plot-option tweak on an unrelated tab no longer silently
 # rebuilds all four figures in the background on every rerun.
-@st.cache_resource(show_spinner=False)
+@st.cache_resource(show_spinner=False, max_entries=6)
 def plot_overall_metrics(
     co2_cave,
     co2_pk,
@@ -2241,10 +2263,10 @@ def plot_overall_metrics(
         axs[0, 1].legend(h1 + h2, l1 + l2, loc="upper right", frameon=True, fontsize=leg_fs)
         axs[0, 0].legend(loc="upper right", frameon=True, fontsize=leg_fs)
 
-    return fig
+    return _detach(fig)
 
 
-@st.cache_resource(show_spinner=False)
+@st.cache_resource(show_spinner=False, max_entries=6)
 def plot_zone_co2(
     cave_zone_co2,
     pk_zone_co2,
@@ -2336,10 +2358,10 @@ def plot_zone_co2(
         l_bot = l_bot + [p.get_label() for p in stage_patches_b]
         _export_figlegend(fig, h_bot, l_bot, where="bottom", fontsize=lfp, anchor_ax=ax2)
 
-    return fig
+    return _detach(fig)
 
 
-@st.cache_resource(show_spinner=False)
+@st.cache_resource(show_spinner=False, max_entries=6)
 def plot_zone_temp(
     cave_zone_temp,
     pk_zone_temp,
@@ -2431,10 +2453,10 @@ def plot_zone_temp(
         l_bot = l_bot + [p.get_label() for p in stage_patches_b]
         _export_figlegend(fig, h_bot, l_bot, where="bottom", fontsize=lfp, anchor_ax=ax2)
 
-    return fig
+    return _detach(fig)
 
 
-@st.cache_resource(show_spinner=False)
+@st.cache_resource(show_spinner=False, max_entries=6)
 def plot_mfc(mfc_df, t_on, t_off, t_rel0, t_rel1, cfg: AppConfig, *, line_width: float = 2.2, legend_fontsize: int = 10, export_mode: bool = False, x_range: Optional[Tuple[Any, Any]] = None, y_range: Optional[Tuple[float, float]] = None):
     lw = float(line_width)
     leg_fs = 15 if export_mode else max(5, min(24, int(legend_fontsize)))
@@ -2511,10 +2533,10 @@ def plot_mfc(mfc_df, t_on, t_off, t_rel0, t_rel1, cfg: AppConfig, *, line_width:
         ax.legend(h1 + h2, l1 + l2, frameon=True, fontsize=leg_fs, loc="upper right")
     else:
         ax.legend(frameon=True, fontsize=leg_fs, loc="upper right")
-    return fig
+    return _detach(fig)
 
 
-@st.cache_resource(show_spinner=False)
+@st.cache_resource(show_spinner=False, max_entries=6)
 def plot_humidity_export(
     rh_cave,
     rh_pk,
@@ -2569,10 +2591,10 @@ def plot_humidity_export(
     all_handles = [h_cave, h_pk] + list(stage_patches)
     all_labels = ["CAVE", "PK"] + [p.get_label() for p in stage_patches]
     _export_figlegend(fig, all_handles, all_labels, where="bottom", fontsize=14, anchor_ax=axs[1])
-    return fig
+    return _detach(fig)
 
 
-@st.cache_resource(show_spinner=False)
+@st.cache_resource(show_spinner=False, max_entries=6)
 def plot_vertical_profiles_export(
     cave_profiles,
     pk_profiles,
@@ -2636,7 +2658,7 @@ def plot_vertical_profiles_export(
             h_all.append(hh)
             l_all.append(ll)
     _export_figlegend(fig, h_all, l_all, where="bottom", fontsize=13, anchor_ax=[ax1, ax2])
-    return fig
+    return _detach(fig)
 
 
 def plot_io_ratio(io_ex, infiltration_factor, t_rel0, t_rel1, t_base0, t_base1, ex_thresh, cfg: AppConfig,
@@ -2674,7 +2696,7 @@ def plot_io_ratio(io_ex, infiltration_factor, t_rel0, t_rel1, t_base0, t_base1, 
     else:
         ax.legend(frameon=True, fontsize=10, loc="upper left")
         plt.tight_layout()
-    return fig
+    return _detach(fig)
 
 
 def plot_scatter(df_sc, slope, intercept, r2, cfg: AppConfig,
@@ -2706,7 +2728,7 @@ def plot_scatter(df_sc, slope, intercept, r2, cfg: AppConfig,
     else:
         ax.legend(frameon=True, fontsize=9, loc="upper left")
         plt.tight_layout()
-    return fig
+    return _detach(fig)
 
 
 # ---- Plotly per-page UI defaults & helpers ---------------------------------
@@ -3751,7 +3773,7 @@ def plot_lambda_integrated_export(res, cfg: AppConfig, other_label: str, solve_l
     plt.tight_layout()
     h, l = ax.get_legend_handles_labels()
     _export_figlegend(fig, h, l, where="bottom", fontsize=13, anchor_ax=ax)
-    return fig
+    return _detach(fig)
 
 
 def plot_lambda_regression_export(res, cfg: AppConfig, other_label: str, solve_label: str):
@@ -3769,7 +3791,7 @@ def plot_lambda_regression_export(res, cfg: AppConfig, other_label: str, solve_l
     plt.tight_layout()
     h, l = ax.get_legend_handles_labels()
     _export_figlegend(fig, h, l, where="bottom", fontsize=13, anchor_ax=ax)
-    return fig
+    return _detach(fig)
 
 
 def plot_lambda_window_export(res, cfg: AppConfig, other_label: str, solve_label: str,
@@ -3792,7 +3814,7 @@ def plot_lambda_window_export(res, cfg: AppConfig, other_label: str, solve_label
     plt.tight_layout()
     h, l = ax.get_legend_handles_labels()
     _export_figlegend(fig, h, l, where="bottom", fontsize=13, anchor_ax=ax)
-    return fig
+    return _detach(fig)
 
 
 def plot_overall_metrics_plotly(
