@@ -652,6 +652,78 @@ def load_mfc_csv(file_bytes: bytes, filename: str) -> pd.DataFrame:
     return dfm
 
 
+MFC_GAP_FACTOR = 5.0
+
+
+def mfc_sampling_gaps(mfc_df: pd.DataFrame, gap_factor: float = MFC_GAP_FACTOR):
+    """Rows that open a logging gap, plus the median sampling interval.
+
+    A run split across several files - the rig stopped, the logger dropped -
+    leaves stretches with no record at all. Nothing says whether gas was
+    flowing then, so those stretches are neither integrated over nor drawn
+    across; they are reported instead. A gap is a step longer than
+    `gap_factor` times the run's own median sampling interval, which catches
+    breaks inside a single file as well as the joins between files.
+
+    Returns (is_gap_start, median_step_seconds) where is_gap_start marks the
+    first row after each break.
+    """
+    t = mfc_df["t"]
+    step = t.diff().dt.total_seconds()
+    med = float(step.median()) if step.notna().any() else np.nan
+    if not np.isfinite(med) or med <= 0:
+        return pd.Series(False, index=mfc_df.index), np.nan
+    return (step > gap_factor * med).fillna(False), med
+
+
+def mfc_plot_frame(mfc_df: pd.DataFrame, gap_factor: float = MFC_GAP_FACTOR) -> pd.DataFrame:
+    """Plotting copy with a blank row opening each logging gap.
+
+    Both matplotlib and plotly break a line at NaN, so this shows an
+    interrupted run as an interrupted trace rather than a straight segment
+    bridging minutes that were never recorded. The underlying frame is left
+    alone - only this copy carries the blanks.
+    """
+    if mfc_df is None or len(mfc_df) < 2:
+        return mfc_df
+    is_gap, _ = mfc_sampling_gaps(mfc_df, gap_factor)
+    if not is_gap.any():
+        return mfc_df
+    blanks = mfc_df.loc[is_gap].copy()
+    prev = mfc_df["t"].shift().loc[is_gap]
+    blanks["t"] = prev + (blanks["t"] - prev) / 2
+    for col in ("F", "Fset", "Fmeas", "T"):
+        if col in blanks.columns:
+            blanks[col] = np.nan
+    return pd.concat([mfc_df, blanks], ignore_index=True).sort_values("t").reset_index(drop=True)
+
+
+def load_mfc_any(files) -> pd.DataFrame:
+    """One MFC frame from one or several uploads, ordered by time.
+
+    A release interrupted part-way through is logged as several files. They
+    are concatenated on timestamp rather than on file order, and duplicated
+    timestamps (a re-upload, or an overlap between parts) collapse to one row.
+    ElapsedTime restarts from zero in each file, so it is never used across
+    them - everything downstream works off the parsed timestamp.
+    """
+    if not isinstance(files, (list, tuple)):
+        files = [files]
+    frames = []
+    for f in files:
+        if f is None:
+            continue
+        d = load_mfc_csv(f.getvalue(), f.name)
+        d["source_file"] = f.name
+        frames.append(d)
+    if not frames:
+        raise ValueError("No MFC file provided.")
+    out = pd.concat(frames, ignore_index=True)
+    out = out.dropna(subset=["t"]).sort_values("t")
+    out = out.drop_duplicates(subset=["t"], keep="first").reset_index(drop=True)
+    return out
+
+
 def add_z_numeric(df: pd.DataFrame) -> pd.DataFrame:
     """Continuous height z (m) from the raw Explora `z` column only."""
     out = df.copy()
@@ -2458,6 +2530,7 @@ def plot_zone_temp(
 
 @st.cache_resource(show_spinner=False, max_entries=6)
 def plot_mfc(mfc_df, t_on, t_off, t_rel0, t_rel1, cfg: AppConfig, *, line_width: float = 2.2, legend_fontsize: int = 10, export_mode: bool = False, x_range: Optional[Tuple[Any, Any]] = None, y_range: Optional[Tuple[float, float]] = None):
+    mfc_df = mfc_plot_frame(mfc_df)
     lw = float(line_width)
     leg_fs = 15 if export_mode else max(5, min(24, int(legend_fontsize)))
     fs_axis = 18 if export_mode else 12
@@ -4230,6 +4303,7 @@ def plot_mfc_plotly(
     y_range=None,
     line_width: float = 2.2,
 ):
+    mfc_df = mfc_plot_frame(mfc_df)
     _require_plotly()
     if mfc_df is None or mfc_df.empty:
         return None
@@ -4335,8 +4409,12 @@ stage_file = st.sidebar.file_uploader(
 )
 
 mfc_file = st.sidebar.file_uploader(
-    "MFC file (optional)",
-    type=["csv", "xlsx", "xlsm", "xls"]
+    "MFC file(s) (optional)",
+    type=["csv", "xlsx", "xlsm", "xls"],
+    accept_multiple_files=True,
+    help="A release interrupted part-way through is logged as several files — "
+         "add all the parts and they are merged on timestamp. Stretches with no "
+         "record are left as gaps: not integrated over, and drawn as breaks.",
 )
 
 def _upload_signature(file_obj) -> str:
@@ -4354,7 +4432,8 @@ def _upload_signature(file_obj) -> str:
         return f"{getattr(file_obj, 'name', '')}|na"
 
 
-_sig = "|".join([_upload_signature(explora_file), _upload_signature(stage_file), _upload_signature(mfc_file)])
+_mfc_sig = "+".join(_upload_signature(f) for f in (mfc_file or [])) if isinstance(mfc_file, (list, tuple)) else _upload_signature(mfc_file)
+_sig = "|".join([_upload_signature(explora_file), _upload_signature(stage_file), _mfc_sig])
 _prev_sig = st.session_state.get("__last_upload_signature", "")
 if _sig and (_sig != _prev_sig):
     # When the user uploads new files, force all plot widgets to re-seed from built-in defaults
@@ -4557,11 +4636,12 @@ try:
         stage_defs = prepare_stage_defs(stage_rows)
 
         mfc_df = None
-        if mfc_file is not None:
+        _mfc_files = [f for f in (mfc_file if isinstance(mfc_file, (list, tuple)) else [mfc_file]) if f is not None]
+        if _mfc_files:
             try:
-                mfc_df = load_mfc_csv(mfc_file.getvalue(), mfc_file.name)
+                mfc_df = load_mfc_any(_mfc_files)
             except Exception as e:
-                st.warning(f"Could not read MFC file: {e}")
+                st.warning(f"Could not read MFC file(s): {e}")
                 mfc_df = None
 
         # -----------------------------
@@ -4764,14 +4844,27 @@ try:
                 f_min = float(df_on["F"].min())
                 f_max = float(df_on["F"].max())
 
-                dt_min = df_on["t"].diff().dt.total_seconds().fillna(0) / 60.0
+                # Integrate flow over time, but never across a logging gap:
+                # the step there spans a stretch with no record, and pretending
+                # the last known flow held for all of it would invent gas that
+                # may never have been released. Those steps contribute nothing
+                # and are reported separately instead.
+                _is_gap, _med_step = mfc_sampling_gaps(df_on)
+                dt_s = df_on["t"].diff().dt.total_seconds()
+                gap_s = float(dt_s.where(_is_gap).sum(skipna=True))
+                dt_min = dt_s.where(~_is_gap).fillna(0) / 60.0
                 total_l = float((df_on["F"] * dt_min).sum())
                 f_cv = (f_std / f_mean) if (np.isfinite(f_std) and f_mean > 0) else np.nan
 
+                _n_src = int(mfc_df["source_file"].nunique()) if "source_file" in mfc_df.columns else 1
                 mfc_summary = {
                     "mfc_start": t_on,
                     "mfc_end": t_off,
                     "mfc_duration_min": dur_min,
+                    "mfc_source_files": _n_src,
+                    "logging_gaps": int(_is_gap.sum()),
+                    "logging_gap_total_min": gap_s / 60.0,
+                    "sampling_interval_s": _med_step,
                     "flow_mean": f_mean,
                     "flow_std": f_std,
                     "flow_cv": f_cv,
