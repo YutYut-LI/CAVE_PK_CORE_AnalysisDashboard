@@ -168,7 +168,8 @@ class AppConfig:
     # Fit-window criterion on |dC|. Relative mode scales with the experiment:
     # the threshold is dc_frac of the peak |dC| in the chosen stage, floored at
     # dc_min_ppm so a tiny release cannot push it into the 0/0 region. Absolute
-    # mode uses dc_min_ppm directly, as the earlier analyses did. The two ppm
+    # mode uses dc_min_ppm directly, as the earlier analyses did; "off" applies
+    # no threshold and fits every point in the window. The two ppm
     # values are separate fields on purpose: sharing one gave relative mode a
     # 100 ppm floor whenever the config was built without the sidebar.
     dc_threshold_mode: str = "relative"
@@ -3325,34 +3326,33 @@ def render_save_reset_row(prefix: str, defaults: Dict[str, Any]) -> None:
 
 def render_window_picker(prefix: str, stage_defs, t_lo, t_hi, default_keywords: Tuple[str, ...],
                          *, stage_help: str = "") -> Tuple[Any, Any, str]:
-    """Time-window chooser: pick a logged stage, or set the window by hand.
+    """Time-window chooser: a logged stage is always the anchor; the window can
+    then be adjusted by hand from there.
 
     Stage boundaries in the experiment log are nominal. The moment a decay
     really starts — mixing switched off, release valve closed — often sits
-    minutes away from the logged time and has to be read off the curves, so
-    manual mode seeds itself from the chosen stage and lets it be nudged.
+    minutes away from the logged time and has to be read off the curves. So the
+    stage comes first and fine-tuning starts from its bounds, rather than the
+    two being offered as alternatives; the earlier Stage/Manual radio made the
+    hand-off between them invisible.
 
     Returns (t0, t1, note).
     """
     stage_names = [str(n) for (n, _, _, _) in stage_defs] if stage_defs else []
+    lo = pd.Timestamp(t_lo).to_pydatetime()
+    hi = pd.Timestamp(t_hi).to_pydatetime()
 
     def _stage_by_name(name):
-        return next(((n, pd.Timestamp(s), pd.Timestamp(e), c)
-                     for (n, s, e, c) in (stage_defs or []) if str(n) == str(name)), None)
+        return next(((n, pd.Timestamp(st_), pd.Timestamp(e), c)
+                     for (n, st_, e, c) in (stage_defs or []) if str(n) == str(name)), None)
 
-    default_stage = None
-    for kw in default_keywords:
-        default_stage = find_stage_by_keyword(stage_defs, kw)
-        if default_stage is not None:
-            break
-    if default_stage is None and stage_defs:
-        n, s, e, c = stage_defs[0]
-        default_stage = (n, pd.Timestamp(s), pd.Timestamp(e), c)
-
-    modes = ["Stage", "Manual"] if stage_names else ["Manual"]
-    mode = st.radio("Window", options=modes, index=0, horizontal=True, key=f"{prefix}__win_mode")
-
-    if mode == "Stage":
+    chosen = None
+    if stage_names:
+        default_stage = None
+        for kw in default_keywords:
+            default_stage = find_stage_by_keyword(stage_defs, kw)
+            if default_stage is not None:
+                break
         idx = 0
         if default_stage is not None:
             try:
@@ -3362,54 +3362,55 @@ def render_window_picker(prefix: str, stage_defs, t_lo, t_hi, default_keywords: 
         pick = st.selectbox("Stage", options=stage_names, index=idx,
                             key=f"{prefix}__stage", help=stage_help)
         chosen = _stage_by_name(pick)
-        if chosen is None:
-            return None, None, "stage not found"
-        return chosen[1], chosen[2], f"stage: {chosen[0]}"
 
-    # ---- Manual ----------------------------------------------------------
-    lo = pd.Timestamp(t_lo).to_pydatetime()
-    hi = pd.Timestamp(t_hi).to_pydatetime()
-
-    # Seed from whichever stage is currently selected, so switching to Manual
-    # starts from where you were rather than jumping somewhere unrelated.
-    seed = _stage_by_name(st.session_state.get(f"{prefix}__stage")) or default_stage
-    if seed is not None:
-        a = max(lo, seed[1].to_pydatetime())
-        b = min(hi, seed[2].to_pydatetime())
+    if chosen is not None:
+        a = max(lo, chosen[1].to_pydatetime())
+        b = min(hi, chosen[2].to_pydatetime())
+        if b <= a:
+            a, b = lo, hi
+        anchor_note = f"stage: {chosen[0]}"
+        anchor_key = str(chosen[0]).replace(" ", "_")
+        finetune = st.checkbox(
+            "Fine-tune start / end by hand", key=f"{prefix}__finetune",
+            help="Starts from this stage's logged bounds. Use it when the real onset of the "
+                 "decay sits a few minutes off the log entry.",
+        )
+        if not finetune:
+            return pd.Timestamp(a), pd.Timestamp(b), anchor_note
     else:
         a, b = lo, hi
-    if b <= a:
-        a, b = lo, hi
+        anchor_note = "manual"
+        anchor_key = "nostage"
+        st.caption("No stage log loaded — set the window by hand over the full recording.")
 
-    typed = st.checkbox("Type exact timestamps instead of dragging", key=f"{prefix}__typed")
+    # ---- hand adjustment, seeded from the anchor -------------------------------
+    # Widget keys carry the stage name so that picking a different stage re-seeds
+    # the controls instead of keeping a position that belonged to the last one.
+    typed = st.checkbox("Type exact timestamps instead of dragging", key=f"{prefix}__typed__{anchor_key}")
     if typed:
-        # Carry over wherever the slider was left, so switching to typed entry
-        # fine-tunes the current window instead of resetting it to the stage.
-        dragged = st.session_state.get(f"{prefix}__manual")
+        dragged = st.session_state.get(f"{prefix}__manual__{anchor_key}")
         if isinstance(dragged, (tuple, list)) and len(dragged) == 2:
             a, b = dragged[0], dragged[1]
-    if typed:
         c1, c2 = st.columns(2)
         with c1:
-            s_txt = st.text_input("Start", value=f"{a:%Y-%m-%d %H:%M:%S}", key=f"{prefix}__t0_txt")
+            s_txt = st.text_input("Start", value=f"{a:%Y-%m-%d %H:%M:%S}", key=f"{prefix}__t0_txt__{anchor_key}")
         with c2:
-            e_txt = st.text_input("End", value=f"{b:%Y-%m-%d %H:%M:%S}", key=f"{prefix}__t1_txt")
+            e_txt = st.text_input("End", value=f"{b:%Y-%m-%d %H:%M:%S}", key=f"{prefix}__t1_txt__{anchor_key}")
         t0 = pd.to_datetime(s_txt, errors="coerce")
         t1 = pd.to_datetime(e_txt, errors="coerce")
         if pd.isna(t0) or pd.isna(t1) or t1 <= t0:
-            st.error("Could not read those timestamps (expected `YYYY-MM-DD HH:MM:SS`, end after start) — falling back to the stage window.")
-            return pd.Timestamp(a), pd.Timestamp(b), "manual (invalid input, stage window used)"
-        return t0, t1, "manual (typed)"
+            st.error("Could not read those timestamps (expected `YYYY-MM-DD HH:MM:SS`, end after start) — using the stage bounds.")
+            return pd.Timestamp(a), pd.Timestamp(b), anchor_note + " (typed input invalid)"
+        return t0, t1, anchor_note + ", adjusted by hand (typed)"
 
     span = hi - lo
     step = _dt.timedelta(minutes=1) if span > _dt.timedelta(hours=2) else _dt.timedelta(seconds=10)
     sel = st.slider(
-        "Drag the ends to set the window",
+        "Drag the ends to adjust the window",
         min_value=lo, max_value=hi, value=(a, b), step=step,
-        format="YYYY-MM-DD HH:mm", key=f"{prefix}__manual",
+        format="YYYY-MM-DD HH:mm", key=f"{prefix}__manual__{anchor_key}",
     )
-    return pd.Timestamp(sel[0]), pd.Timestamp(sel[1]), "manual (slider)"
-
+    return pd.Timestamp(sel[0]), pd.Timestamp(sel[1]), anchor_note + ", adjusted by hand"
 
 def _y_pair_from_prefix(prefix: str, fb_lo: float, fb_hi: float) -> Tuple[float, float]:
     lo = float(st.session_state.get(f"{prefix}__y_min", fb_lo))
@@ -3771,6 +3772,43 @@ def _lam_titles(cfg: AppConfig, src_label: str, rcv_label: str) -> Tuple[str, st
         f"{cfg.exp_code} — {who} | full regression",
         f"{cfg.exp_code} — {who} | sliding window",
     )
+
+
+def plot_dc_window_plotly(ex_drive, ex_solve, t0, t1, idx_fit, dc_thresh, dc_peak,
+                          mode_note: str, cfg: AppConfig, other_label: str, solve_label: str):
+    """|ΔC| across the whole selected window, with the threshold and the stretch
+    the fit actually used. This is the auto-detection made visible: what was
+    kept, what was left out, and the single number that decided it."""
+    _require_plotly()
+    idx = ex_drive.dropna().index.intersection(ex_solve.dropna().index)
+    idx = idx[(idx >= pd.Timestamp(t0)) & (idx <= pd.Timestamp(t1))]
+    dc = (ex_drive.reindex(idx) - ex_solve.reindex(idx)).astype(float)
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=idx, y=dc.abs().values, mode="lines", name=f"|ΔC| = |{other_label}_ex − {solve_label}_ex|",
+        line=dict(width=2),
+        hovertemplate="t=%{x|%H:%M:%S}<br>|ΔC|=%{y:.1f} ppm<extra></extra>",
+    ))
+    if len(idx_fit):
+        fig.add_vrect(x0=idx_fit[0], x1=idx_fit[-1], fillcolor="green", opacity=0.12, line_width=0,
+                      annotation_text="used for the fit", annotation_position="top left")
+    if np.isfinite(dc_thresh) and dc_thresh > 0:
+        fig.add_hline(y=dc_thresh, line_dash="dash", line_width=2,
+                      annotation_text=f"threshold {dc_thresh:.0f} ppm ({mode_note})", annotation_position="top right")
+    if np.isfinite(dc_peak) and len(dc):
+        t_peak = dc.abs().idxmax()
+        fig.add_trace(go.Scatter(x=[t_peak], y=[dc_peak], mode="markers+text", name="peak",
+                                 marker=dict(size=10, symbol="diamond"),
+                                 text=[f"peak {dc_peak:.0f} ppm"], textposition="top center",
+                                 hoverinfo="skip"))
+    fig.update_layout(
+        title=f"{cfg.exp_code} — |ΔC| over the selected window: what the threshold keeps",
+        xaxis_title="Time", yaxis_title=f"|ΔC| (ppm)",
+        template="plotly_white", height=380,
+        margin=dict(l=45, r=20, t=60, b=45),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+    )
+    return fig
 
 
 def plot_lambda_integrated_plotly(res, cfg: AppConfig, src_label: str, rcv_label: str):
@@ -4535,13 +4573,14 @@ exclude_envelope_from_bulk = st.sidebar.checkbox(
          "interface series it gets compared against.",
 )
 dc_threshold_mode = st.sidebar.radio(
-    "ΔC threshold", options=["Relative to peak |ΔC|", "Absolute (ppm)"],
+    "ΔC threshold", options=["Relative to peak |ΔC|", "Absolute (ppm)", "Off — whole window"],
     index=0, horizontal=True,
     help="The fit uses the longest unbroken stretch where |ΔC| stays above the threshold "
          "and keeps one sign. Relative scales the threshold to each experiment: a CAVE "
          "release with a 700 ppm gradient and a PK release with a 300 ppm one both keep "
          "the same fraction of their decay. Absolute is the fixed ppm used in the earlier "
-         "analyses.",
+         "analyses. Off applies no threshold at all: every point in the window is fitted, "
+         "including the tail where ΔC has collapsed toward zero.",
 )
 if dc_threshold_mode.startswith("Relative"):
     dc_frac = st.sidebar.slider(
@@ -4555,12 +4594,16 @@ if dc_threshold_mode.startswith("Relative"):
              "into 0/0 whatever the threshold, so keep a few tens of ppm of gradient.",
     )
     dc_min_ppm = 100.0
-else:
+elif dc_threshold_mode.startswith("Absolute"):
     dc_frac = 0.0
     dc_floor_ppm = 10.0
     dc_min_ppm = st.sidebar.number_input(
         "ΔC threshold (ppm)", min_value=0.0, value=100.0, step=10.0,
     )
+else:
+    dc_frac = 0.0
+    dc_floor_ppm = 0.0
+    dc_min_ppm = 0.0
 
 _c1, _c2 = st.sidebar.columns(2)
 with _c1:
@@ -4656,7 +4699,8 @@ cfg = AppConfig(
     noise_sigma_k=float(noise_sigma_k),
     envelope_walls=split_str_list(envelope_walls),
     exclude_envelope_from_bulk=bool(exclude_envelope_from_bulk),
-    dc_threshold_mode="relative" if dc_threshold_mode.startswith("Relative") else "absolute",
+    dc_threshold_mode=("relative" if dc_threshold_mode.startswith("Relative")
+                       else "absolute" if dc_threshold_mode.startswith("Absolute") else "off"),
     dc_frac=float(dc_frac),
     dc_floor_ppm=float(dc_floor_ppm),
     dc_min_ppm=float(dc_min_ppm),
@@ -6841,8 +6885,7 @@ with tab_ae:
         _fit_ok = False
         if _fit_t0 is None or _fit_t1 is None:
             st.warning(
-                "No fitting window. Upload a stage log, or switch the window control to "
-                "**Manual** and set the start and end by hand."
+                "No fitting window. Upload a stage log, or set the start and end by hand above."
             )
         else:
             _sname, _sstart, _send = _fit_note, _fit_t0, _fit_t1
@@ -6862,7 +6905,10 @@ with tab_ae:
             _pk_idx = ex_drive.dropna().index.intersection(ex_solve.dropna().index)
             _pk_idx = _pk_idx[(_pk_idx >= pd.Timestamp(_sstart)) & (_pk_idx <= pd.Timestamp(_send))]
             _dc_peak = float((ex_drive.reindex(_pk_idx) - ex_solve.reindex(_pk_idx)).abs().max()) if len(_pk_idx) else np.nan
-            if cfg.dc_threshold_mode == "relative" and np.isfinite(_dc_peak):
+            if cfg.dc_threshold_mode == "off":
+                dc_thresh = 0.0
+                dc_thresh_note = "off"
+            elif cfg.dc_threshold_mode == "relative" and np.isfinite(_dc_peak):
                 dc_thresh = max(cfg.dc_frac * _dc_peak, cfg.dc_floor_ppm)
                 dc_thresh_note = (f"{cfg.dc_frac:.0%} of peak |ΔC| {_dc_peak:.0f} ppm"
                                   + (f", floored at {cfg.dc_floor_ppm:.0f} ppm" if cfg.dc_frac * _dc_peak < cfg.dc_floor_ppm else ""))
@@ -6870,9 +6916,48 @@ with tab_ae:
                 dc_thresh = cfg.dc_min_ppm
                 dc_thresh_note = "absolute"
 
-            idx_fit, dC_fit, end_reason = select_exchange_window(
-                ex_drive, ex_solve, _sstart, _send, dc_thresh
-            )
+            if cfg.dc_threshold_mode == "off":
+                idx_fit = _pk_idx
+                dC_fit = (ex_drive.reindex(idx_fit) - ex_solve.reindex(idx_fit)).astype(float)
+                _flips = int((np.sign(dC_fit.to_numpy()[1:]) != np.sign(dC_fit.to_numpy()[:-1])).sum()) if len(dC_fit) > 1 else 0
+                end_reason = "no threshold — every point in the window is used"
+                if _flips:
+                    end_reason += f" (ΔC changes sign {_flips} times inside it)"
+            else:
+                idx_fit, dC_fit, end_reason = select_exchange_window(
+                    ex_drive, ex_solve, _sstart, _send, dc_thresh
+                )
+
+            # What the threshold means, in this experiment's own numbers.
+            with st.expander(f"How the fit window is chosen (ΔC threshold)", expanded=False):
+                st.markdown(
+                    f"**ΔC** is the gradient driving the exchange: **{other_label}_ex − {solve_label}_ex**. "
+                    "The model needs that gradient; where it has collapsed there is nothing to fit.\n\n"
+                    f"**Peak |ΔC|** is the largest gradient anywhere inside the window you selected "
+                    f"({pd.Timestamp(_sstart):%H:%M} → {pd.Timestamp(_send):%H:%M}) — the start of a decay, the crest of "
+                    f"a rise. Here it is **{_dc_peak:.0f} ppm**.\n\n"
+                    + (
+                        f"**Relative mode:** the threshold is {cfg.dc_frac:.0%} of that peak = **{cfg.dc_frac * _dc_peak:.0f} ppm**"
+                        + (f", raised to the {cfg.dc_floor_ppm:.0f} ppm floor" if cfg.dc_frac * _dc_peak < cfg.dc_floor_ppm else "")
+                        + f". The fit keeps the longest unbroken stretch where |ΔC| stays **at or above {dc_thresh:.0f} ppm** "
+                          "and keeps one sign: it begins at the first such point and ends where the gradient drops below "
+                          "the line or reverses. Lower the fraction in the sidebar to keep more of the tail."
+                        if cfg.dc_threshold_mode == "relative" else
+                        f"**Absolute mode:** the threshold is a fixed **{dc_thresh:.0f} ppm**. The fit keeps the longest "
+                        f"unbroken stretch where |ΔC| stays at or above it and keeps one sign."
+                        if cfg.dc_threshold_mode == "absolute" else
+                        f"**Off:** no threshold. Every point in the selected window is fitted, including any tail where "
+                        f"|ΔC| has fallen to a few ppm. Expect a lower R\u00b2 there — the model has no gradient to work with."
+                    )
+                )
+
+            if len(_pk_idx):
+                _fig_dc = plot_dc_window_plotly(
+                    ex_drive, ex_solve, _sstart, _send, idx_fit, dc_thresh, _dc_peak,
+                    dc_thresh_note, cfg, other_label, solve_label,
+                )
+                apply_plotly_style(_fig_dc, _style_ae)
+                show_plotly_chart(_fig_dc)
 
             if len(idx_fit) < cfg.lam_min_pts_int:
                 st.warning(
@@ -6921,7 +7006,7 @@ with tab_ae:
                         "together at the rate CAVE loses tracer to outdoors, which is a different "
                         "quantity.\n\n"
                         "To take in more of the decay, lower the **ΔC threshold** in the sidebar "
-                        "(section 5) - the fraction of the peak, or the floor. The noise floor is far below any sensible value, so the real "
+                        "(section 5) - the fraction of the peak, or the floor - or set it to Off to fit the whole window. The noise floor is far below any sensible value, so the real "
                         "limit is different: as ΔC → 0 the estimate becomes 0/0 whatever the "
                         "threshold, so stop where |ΔC| is still tens of ppm rather than chasing "
                         "the tail."
