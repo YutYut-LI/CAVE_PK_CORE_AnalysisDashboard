@@ -66,6 +66,13 @@ pip install -r requirements.txt
 streamlit run app.py
 ```
 
+**Windows shortcut:** double-click `run_dashboard.bat` instead. It finds an
+interpreter that has streamlit — useful when `streamlit` is not on PATH, or
+when `python` resolves to the Microsoft Store placeholder — and starts the app
+with change-polling enabled, which matters if the repo sits in OneDrive, where
+filesystem events go missing and Streamlit otherwise keeps serving stale code.
+Close the console window to stop the app.
+
 Open the URL shown in the terminal (usually `http://localhost:8501`). Upload your Explora file in the sidebar, adjust settings, and click **Run analysis**.
 
 ---
