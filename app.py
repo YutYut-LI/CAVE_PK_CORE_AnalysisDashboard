@@ -6686,6 +6686,17 @@ with tab_ae:
             "as-is — clipping it would bias the mean upward."
         )
 
+        _n_all = tr["n"] + tr["n_gated"]
+        if _n_all and tr["n_gated"] / _n_all > 0.5:
+            st.info(
+                f"**{tr['n_gated']} of {_n_all} bins** in this window are not shown because "
+                f"{src_label}_ex, the denominator, had fallen below the {ex_thresh:.0f} ppm gate "
+                "— the source zone had largely emptied. The trace ends there rather than "
+                "dividing by a number close to zero. Lowering **Absolute excess threshold (ppm)** "
+                "in the sidebar (section 4) extends it; the ratio just gets noisier as the "
+                "denominator shrinks."
+            )
+
         if tr["n"] < 10:
             st.warning(
                 f"Only **{tr['n']}** points survive the threshold inside this window. "
@@ -6835,6 +6846,37 @@ with tab_ae:
                     f"Window **{idx_fit[0]:%H:%M:%S} → {idx_fit[-1]:%H:%M:%S}** "
                     f"({len(idx_fit)} points) — {end_reason}. Driving concentration: {drive_note}."
                 )
+
+                # A window far shorter than the stage it was asked to cover is
+                # not a gap in the data. It means the gradient the model needs
+                # collapsed: the two zones equilibrated and there is nothing
+                # left for dC_solve/dt = lambda*dC to fit. Say so, with numbers,
+                # rather than leaving a 27-minute window to speak for itself.
+                _stage_h = (pd.Timestamp(_send) - pd.Timestamp(_sstart)).total_seconds() / 3600.0
+                _win_h = (idx_fit[-1] - idx_fit[0]).total_seconds() / 3600.0
+                if _stage_h > 0 and _win_h / _stage_h < 0.5 and "dropped below" in end_reason:
+                    _rest_idx = ex_drive.dropna().index.intersection(ex_solve.dropna().index)
+                    _rest_idx = _rest_idx[(_rest_idx > idx_fit[-1]) & (_rest_idx <= pd.Timestamp(_send))]
+                    _rest_dc = (ex_drive.reindex(_rest_idx) - ex_solve.reindex(_rest_idx)).abs()
+                    _rest_med = float(_rest_dc.median()) if len(_rest_dc) else np.nan
+                    _rest_txt = (
+                        f"over the remaining {_stage_h - _win_h:.1f} h of the stage |ΔC| sat around "
+                        f"**{_rest_med:.0f} ppm**"
+                        if np.isfinite(_rest_med) else "no further overlapping data"
+                    )
+                    st.info(
+                        f"The fit used **{_win_h:.1f} h of a {_stage_h:.1f} h stage**. It stopped where "
+                        f"|ΔC| fell below {cfg.dc_min_ppm:.0f} ppm, and {_rest_txt} — the two zones "
+                        "had equilibrated. That is not missing data: once the gradient is gone there "
+                        "is nothing left for the exchange model to fit, and both zones then decay "
+                        "together at the rate CAVE loses tracer to outdoors, which is a different "
+                        "quantity.\n\n"
+                        "To take in more of the decay, lower **ΔC threshold (ppm)** in the sidebar "
+                        "(section 5). The noise floor is far below any sensible value, so the real "
+                        "limit is different: as ΔC → 0 the estimate becomes 0/0 whatever the "
+                        "threshold, so stop where |ΔC| is still tens of ppm rather than chasing "
+                        "the tail."
+                    )
 
                 _sv = solve_fit.dropna()
                 _sv_range = float(_sv.max() - _sv.min()) if len(_sv) else np.nan
