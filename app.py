@@ -1937,8 +1937,35 @@ def mean_in_window(series, t0, t1):
     return float(s.mean()) if len(s) else np.nan
 
 
+def _summary_value(v) -> str:
+    """One summary value as display text."""
+    if v is None:
+        return ""
+    if isinstance(v, (bool, np.bool_)):
+        return str(bool(v))
+    if isinstance(v, pd.Timestamp):
+        return "" if pd.isna(v) else v.strftime("%Y-%m-%d %H:%M:%S")
+    if isinstance(v, (int, np.integer)):
+        return str(int(v))
+    if isinstance(v, (float, np.floating)):
+        return "" if not np.isfinite(v) else f"{float(v):.6g}"
+    return str(v)
+
+
 def build_summary_df(summary_dict: dict) -> pd.DataFrame:
-    return pd.DataFrame({"metric": list(summary_dict.keys()), "value": list(summary_dict.values())})
+    """Two-column metric/value table, with every value rendered as text.
+
+    These tables mix timestamps, counts, floats and free-text notes in one
+    column. st.dataframe serialises through Arrow, which needs a single type
+    per column and raises on the mixture - the table is then replaced by an
+    error box. Formatting each value here keeps one type, and keeps the
+    number and date formatting consistent between the table on screen and the
+    CSV downloaded from it.
+    """
+    return pd.DataFrame({
+        "metric": list(summary_dict.keys()),
+        "value": [_summary_value(v) for v in summary_dict.values()],
+    })
 
 
 def find_stage_by_keyword(stage_defs, keyword: str):
