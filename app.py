@@ -165,7 +165,16 @@ class AppConfig:
     exclude_envelope_from_bulk: bool = True
 
     # Exchange-rate window / fit settings
-    dc_min_ppm: float = 100.0       # continuous |dC| criterion from window start
+    # Fit-window criterion on |dC|. Relative mode scales with the experiment:
+    # the threshold is dc_frac of the peak |dC| in the chosen stage, floored at
+    # dc_min_ppm so a tiny release cannot push it into the 0/0 region. Absolute
+    # mode uses dc_min_ppm directly, as the earlier analyses did. The two ppm
+    # values are separate fields on purpose: sharing one gave relative mode a
+    # 100 ppm floor whenever the config was built without the sidebar.
+    dc_threshold_mode: str = "relative"
+    dc_frac: float = 0.10
+    dc_floor_ppm: float = 10.0
+    dc_min_ppm: float = 100.0
     lam_win_min: int = 15           # sliding-window length (minutes)
     lam_step_min: int = 5           # sliding-window step (minutes)
     lam_min_pts_win: int = 10
@@ -4525,11 +4534,33 @@ exclude_envelope_from_bulk = st.sidebar.checkbox(
     help="Leaving them in both distorts the CAVE bulk mean and correlates it with the "
          "interface series it gets compared against.",
 )
-dc_min_ppm = st.sidebar.number_input(
-    "ΔC threshold (ppm)", min_value=0.0, value=100.0, step=10.0,
-    help="The fit uses the longest unbroken stretch where |ΔC| (the gradient across the "
-         "two zones) stays above this value and keeps one sign.",
+dc_threshold_mode = st.sidebar.radio(
+    "ΔC threshold", options=["Relative to peak |ΔC|", "Absolute (ppm)"],
+    index=0, horizontal=True,
+    help="The fit uses the longest unbroken stretch where |ΔC| stays above the threshold "
+         "and keeps one sign. Relative scales the threshold to each experiment: a CAVE "
+         "release with a 700 ppm gradient and a PK release with a 300 ppm one both keep "
+         "the same fraction of their decay. Absolute is the fixed ppm used in the earlier "
+         "analyses.",
 )
+if dc_threshold_mode.startswith("Relative"):
+    dc_frac = st.sidebar.slider(
+        "Stop when |ΔC| falls below … of its peak", min_value=0.02, max_value=0.50,
+        value=0.10, step=0.01, format="%.2f",
+    )
+    dc_floor_ppm = st.sidebar.number_input(
+        "… but never below (ppm)", min_value=0.0, value=10.0, step=5.0,
+        help="Floor for the relative threshold. Noise is not the concern - the region mean "
+             "is good to a fraction of a ppm - but as ΔC approaches zero the estimate turns "
+             "into 0/0 whatever the threshold, so keep a few tens of ppm of gradient.",
+    )
+    dc_min_ppm = 100.0
+else:
+    dc_frac = 0.0
+    dc_floor_ppm = 10.0
+    dc_min_ppm = st.sidebar.number_input(
+        "ΔC threshold (ppm)", min_value=0.0, value=100.0, step=10.0,
+    )
 
 _c1, _c2 = st.sidebar.columns(2)
 with _c1:
@@ -4625,6 +4656,9 @@ cfg = AppConfig(
     noise_sigma_k=float(noise_sigma_k),
     envelope_walls=split_str_list(envelope_walls),
     exclude_envelope_from_bulk=bool(exclude_envelope_from_bulk),
+    dc_threshold_mode="relative" if dc_threshold_mode.startswith("Relative") else "absolute",
+    dc_frac=float(dc_frac),
+    dc_floor_ppm=float(dc_floor_ppm),
     dc_min_ppm=float(dc_min_ppm),
     lam_win_min=int(lam_win_min),
     lam_step_min=int(lam_step_min),
@@ -6822,8 +6856,22 @@ with tab_ae:
                 ex_drive = excess_mean_series(_sub, cfg.align_to, max(1, min(cfg.min_sensors, _n_sub)))
                 drive_note = f"{other_label}: {', '.join(_drive_walls)} ({_n_sub} sensors)"
 
+            # Resolve the |ΔC| threshold for this stage. In relative mode it is a
+            # fraction of the largest gradient seen in the stage - the start of a
+            # decay, the crest of a rise - floored so it cannot chase ΔC to zero.
+            _pk_idx = ex_drive.dropna().index.intersection(ex_solve.dropna().index)
+            _pk_idx = _pk_idx[(_pk_idx >= pd.Timestamp(_sstart)) & (_pk_idx <= pd.Timestamp(_send))]
+            _dc_peak = float((ex_drive.reindex(_pk_idx) - ex_solve.reindex(_pk_idx)).abs().max()) if len(_pk_idx) else np.nan
+            if cfg.dc_threshold_mode == "relative" and np.isfinite(_dc_peak):
+                dc_thresh = max(cfg.dc_frac * _dc_peak, cfg.dc_floor_ppm)
+                dc_thresh_note = (f"{cfg.dc_frac:.0%} of peak |ΔC| {_dc_peak:.0f} ppm"
+                                  + (f", floored at {cfg.dc_floor_ppm:.0f} ppm" if cfg.dc_frac * _dc_peak < cfg.dc_floor_ppm else ""))
+            else:
+                dc_thresh = cfg.dc_min_ppm
+                dc_thresh_note = "absolute"
+
             idx_fit, dC_fit, end_reason = select_exchange_window(
-                ex_drive, ex_solve, _sstart, _send, cfg.dc_min_ppm
+                ex_drive, ex_solve, _sstart, _send, dc_thresh
             )
 
             if len(idx_fit) < cfg.lam_min_pts_int:
@@ -6835,7 +6883,7 @@ with tab_ae:
             else:
                 solve_fit = ex_solve.reindex(idx_fit).astype(float)
                 res_int = lambda_integrated(solve_fit, dC_fit, cfg.force_zero_intercept, lambda_ext_per_s)
-                res_full = lambda_differential(solve_fit, dC_fit, cfg.dc_min_ppm, lambda_ext_per_s)
+                res_full = lambda_differential(solve_fit, dC_fit, dc_thresh, lambda_ext_per_s)
                 res_win = lambda_sliding(
                     res_full["X"], res_full["Y"], res_full["t_mid"],
                     cfg.lam_win_min, cfg.lam_step_min, cfg.lam_min_pts_win,
@@ -6844,7 +6892,8 @@ with tab_ae:
 
                 st.caption(
                     f"Window **{idx_fit[0]:%H:%M:%S} → {idx_fit[-1]:%H:%M:%S}** "
-                    f"({len(idx_fit)} points) — {end_reason}. Driving concentration: {drive_note}."
+                    f"({len(idx_fit)} points) — {end_reason}. Driving concentration: {drive_note}. "
+                    f"|ΔC| threshold {dc_thresh:.0f} ppm ({dc_thresh_note})."
                 )
 
                 # A window far shorter than the stage it was asked to cover is
@@ -6866,13 +6915,13 @@ with tab_ae:
                     )
                     st.info(
                         f"The fit used **{_win_h:.1f} h of a {_stage_h:.1f} h stage**. It stopped where "
-                        f"|ΔC| fell below {cfg.dc_min_ppm:.0f} ppm, and {_rest_txt} — the two zones "
+                        f"|ΔC| fell below {dc_thresh:.0f} ppm, and {_rest_txt} — the two zones "
                         "had equilibrated. That is not missing data: once the gradient is gone there "
                         "is nothing left for the exchange model to fit, and both zones then decay "
                         "together at the rate CAVE loses tracer to outdoors, which is a different "
                         "quantity.\n\n"
-                        "To take in more of the decay, lower **ΔC threshold (ppm)** in the sidebar "
-                        "(section 5). The noise floor is far below any sensible value, so the real "
+                        "To take in more of the decay, lower the **ΔC threshold** in the sidebar "
+                        "(section 5) - the fraction of the peak, or the floor. The noise floor is far below any sensible value, so the real "
                         "limit is different: as ΔC → 0 the estimate becomes 0/0 whatever the "
                         "threshold, so stop where |ΔC| is still tens of ppm rather than chasing "
                         "the tail."
@@ -7044,7 +7093,10 @@ with tab_ae:
                     "fit_window_end": idx_fit[-1],
                     "fit_n_points": int(len(idx_fit)),
                     "fit_end_reason": end_reason,
-                    "dc_threshold_ppm": cfg.dc_min_ppm,
+                    "dc_threshold_mode": cfg.dc_threshold_mode,
+                    "dc_threshold_frac": cfg.dc_frac if cfg.dc_threshold_mode == "relative" else np.nan,
+                    "dc_peak_ppm": _dc_peak,
+                    "dc_threshold_ppm": dc_thresh,
                     "lambda_integrated_1ph": res_int["lam_h"],
                     "lambda_integrated_r2": res_int["r2"],
                     "lambda_full_1ph": res_full["lam_h"],
