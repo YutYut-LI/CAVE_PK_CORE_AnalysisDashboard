@@ -2220,6 +2220,7 @@ def plot_overall_metrics(
     export_mode: bool = False,
     y_overrides: Optional[Dict[str, Tuple[float, float]]] = None,
     use_fixed_y: Optional[bool] = None,
+    fixed_panels: Optional[set] = None,
 ):
     lw_c = float(line_width) * 1.5
     lw_p = float(line_width) * 1.0
@@ -2329,6 +2330,11 @@ def plot_overall_metrics(
         if key in _always_fixed:
             src = y_overrides if (export_mode and y_overrides) else y
             return src.get(key, y[key])
+        if fixed_panels is not None:
+            if key in fixed_panels:
+                src = y_overrides if y_overrides else y
+                return src.get(key, y[key])
+            return _auto_ylim(*series) or y[key]
         if export_mode and use_fixed_y is not None:
             if use_fixed_y:
                 src = y_overrides if y_overrides else y
@@ -3165,6 +3171,14 @@ def _collect_ylims_from_prefix(prefix: str, ykeys: List[Tuple[str, str]], fallba
     return out
 
 
+def _fixed_panels_from_prefix(prefix: str, ykeys: List[Tuple[str, str]], use_all: bool) -> set:
+    """Which panels get their fixed y-limits: every one when the master toggle
+    is on, otherwise just those whose own "Fix" box is ticked."""
+    if use_all:
+        return {k for k, _ in ykeys}
+    return {k for k, _ in ykeys if bool(st.session_state.get(f"{prefix}__y_{k}_fix", False))}
+
+
 def _x_mode_option_list(stage_defs) -> List[str]:
     opts = ["Full data (+ pre-minutes)", "Manual (time slider)"]
     if stage_defs:
@@ -3567,6 +3581,7 @@ OVERALL_PAGE_DEFAULTS: Dict[str, Any] = {
     **OVERALL_WIDGET_DEFAULTS,
     **{f"y_{k}_min": _ylim0[k][0] for k, _ in OVERALL_Y_KEYS},
     **{f"y_{k}_max": _ylim0[k][1] for k, _ in OVERALL_Y_KEYS},
+    **{f"y_{k}_fix": False for k, _ in OVERALL_Y_KEYS},
 }
 
 
@@ -4128,6 +4143,7 @@ def plot_overall_metrics_plotly(
     ylims_src: Optional[Dict[str, Tuple[float, float]]] = None,
     use_fixed_y: Optional[bool] = None,
     show_subplot_titles: bool = False,
+    fixed_panels: Optional[set] = None,
     line_width: float = 2.0,
     marker_size: float = 6.0,
 ):
@@ -4275,17 +4291,21 @@ def plot_overall_metrics_plotly(
 
     apply_y = cfg.use_fixed_ylims if use_fixed_y is None else bool(use_fixed_y)
     yref = ylims_src if ylims_src is not None else cfg.ylims
-    if apply_y and yref is not None:
+    # A panel is fixed when it is in fixed_panels (per-panel choice) or,
+    # with no such set given, when the master toggle is on.
+    _is_fixed = (lambda k: k in fixed_panels) if fixed_panels is not None else (lambda k: apply_y)
+    if yref is not None:
         y = yref
-        fig.update_yaxes(range=list(y["co2_mean"]), row=1, col=1)
-        fig.update_yaxes(range=list(y["co2_std"]), row=2, col=1)
-        fig.update_yaxes(range=list(y["co2_cv"]), row=3, col=1)
-        fig.update_yaxes(range=list(y["co2_mi"]), row=4, col=1)
-
-        fig.update_yaxes(range=list(y["temp_mean"]), row=1, col=2, secondary_y=False)
-        fig.update_yaxes(range=list(y["temp_std"]), row=2, col=2)
-        fig.update_yaxes(range=list(y["temp_deltaT"]), row=3, col=2)
-        fig.update_yaxes(range=list(y["temp_pk_minus_cave"]), row=1, col=2, secondary_y=True)
+        for _k, _row, _col, _sec in (
+            ("co2_mean", 1, 1, None), ("co2_std", 2, 1, None), ("co2_cv", 3, 1, None), ("co2_mi", 4, 1, None),
+            ("temp_mean", 1, 2, False), ("temp_std", 2, 2, None), ("temp_deltaT", 3, 2, None),
+            ("temp_pk_minus_cave", 1, 2, True),
+        ):
+            if _is_fixed(_k):
+                if _sec is None:
+                    fig.update_yaxes(range=list(y[_k]), row=_row, col=_col)
+                else:
+                    fig.update_yaxes(range=list(y[_k]), row=_row, col=_col, secondary_y=_sec)
 
     # Coverage/R²/Temp-MI have a genuine fixed domain (0-100 or 0-1) and stay
     # on that fixed scale regardless of the "Use fixed y-limits" toggle above
@@ -5375,10 +5395,15 @@ with tab2:
             render_font_legend_widgets("overall")
             render_series_line_marker_widgets("overall")
             st.checkbox("Show subplot titles (panel headers)", key="overall__show_subplot_titles")
-            st.checkbox("Use fixed y-limits (all panels)", key="overall__use_fixed_y")
+            st.checkbox("Use fixed y-limits (all panels)", key="overall__use_fixed_y",
+                        help="Leave this off and tick Fix on individual panels below to fix "
+                             "only those; the rest keep auto-scaling.")
             with st.expander("Y-axis limits (per panel)", expanded=False):
+                st.caption("Fix = use this panel's min / max even when the master toggle above is off.")
                 for key, label in OVERALL_Y_KEYS:
-                    c1, c2 = st.columns(2)
+                    c0, c1, c2 = st.columns([1, 2, 2])
+                    with c0:
+                        st.checkbox("Fix", key=f"overall__y_{key}_fix", help=f"Fix the {label} panel")
                     with c1:
                         st.number_input(f"{label} — min", key=f"overall__y_{key}_min")
                     with c2:
@@ -5390,6 +5415,7 @@ with tab2:
         y_fb = default_ylims()
         y_merged = _collect_ylims_from_prefix("overall", OVERALL_Y_KEYS, y_fb)
         use_fy = bool(st.session_state.get("overall__use_fixed_y", True))
+        fixed_ov = _fixed_panels_from_prefix("overall", OVERALL_Y_KEYS, use_fy)
         show_panels = bool(st.session_state.get("overall__show_subplot_titles", False))
         lw_ov, ms_ov = _line_marker_from_prefix("overall")
         fig_overall_p = plot_overall_metrics_plotly(
@@ -5404,6 +5430,7 @@ with tab2:
             x1,
             ylims_src=y_merged,
             use_fixed_y=use_fy,
+            fixed_panels=fixed_ov,
             show_subplot_titles=show_panels,
             line_width=lw_ov,
             marker_size=ms_ov,
@@ -7638,6 +7665,7 @@ with tab8:
         x0_ov, x1_ov = render_x_controls("overall", t0, t1, stage_defs)
         y_merged_ov = _collect_ylims_from_prefix("overall", OVERALL_Y_KEYS, default_ylims())
         use_fy_ov = bool(st.session_state.get("overall__use_fixed_y", True))
+        fixed_ov_exp = _fixed_panels_from_prefix("overall", OVERALL_Y_KEYS, use_fy_ov)
 
         xa_c_exp, xa_c1_exp = render_x_controls("zco2_cave", t0, t1, stage_defs)
         uy_c_exp = bool(st.session_state.get("zco2_cave__use_fixed_y", True))
@@ -7672,7 +7700,7 @@ with tab8:
                 co2_cave, co2_pk, temp_cave, temp_pk, deltaT_pk_minus_cave,
                 stage_defs, cfg, x0_ov, x1_ov,
                 line_width=lw_overall, legend_fontsize=leg_overall, export_mode=True,
-                y_overrides=y_merged_ov, use_fixed_y=use_fy_ov,
+                y_overrides=y_merged_ov, use_fixed_y=use_fy_ov, fixed_panels=fixed_ov_exp,
             )
             _download_row(fig_overall_export, "overall_metrics", "overall metrics")
 
