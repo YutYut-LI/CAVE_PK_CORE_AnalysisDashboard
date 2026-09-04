@@ -5177,7 +5177,7 @@ except Exception as e:
 
 
 def render_pk_floorplan_tab(prefix: str, value_col: str, value_label: str, unit: str,
-                            default_y: Tuple[float, float]) -> None:
+                            default_y: Tuple[float, float], fixed_y_default: bool = False) -> None:
     """The PK per-room floor-plan view for one measured quantity.
 
     Both the CO2 and the temperature tab are this same view; only the column
@@ -5209,7 +5209,7 @@ def render_pk_floorplan_tab(prefix: str, value_col: str, value_label: str, unit:
     with st.expander("Plot options (applies to every room on this floor)", expanded=False):
         st.markdown("**X-axis (time)**")
         render_x_mode_widgets(prefix, t0, t1, stage_defs)
-        st.checkbox("Use fixed y-limits (all rooms)", key=f"{prefix}__use_fixed_y", value=False)
+        st.checkbox("Use fixed y-limits (all rooms)", key=f"{prefix}__use_fixed_y", value=fixed_y_default)
         c1, c2 = st.columns(2)
         with c1:
             st.number_input("Y min", key=f"{prefix}__y_min", value=float(default_y[0]))
@@ -5218,7 +5218,7 @@ def render_pk_floorplan_tab(prefix: str, value_col: str, value_label: str, unit:
 
     x0_fp, x1_fp = render_x_controls(prefix, t0, t1, stage_defs)
     y_range_fp = None
-    if bool(st.session_state.get(f"{prefix}__use_fixed_y", False)):
+    if bool(st.session_state.get(f"{prefix}__use_fixed_y", fixed_y_default)):
         y_range_fp = (
             float(st.session_state.get(f"{prefix}__y_min", default_y[0])),
             float(st.session_state.get(f"{prefix}__y_max", default_y[1])),
@@ -5631,7 +5631,10 @@ with tab9:
     render_pk_floorplan_tab("pkfp", "co2", "CO₂", "ppm", (350.0, 2000.0))
 
 with tab10:
-    render_pk_floorplan_tab("pkfp_t", "temperature", "Temperature", "°C", (10.0, 35.0))
+    # Room temperatures sit within a few degrees of each other, so a common
+    # scale is the useful default here; per-room autoscale would exaggerate noise.
+    render_pk_floorplan_tab("pkfp_t", "temperature", "Temperature", "°C", (10.0, 35.0),
+                            fixed_y_default=True)
 
 with tab4:
     st.subheader("Sensor CO₂ & temperature compare")
@@ -7746,7 +7749,7 @@ with tab8:
                 # y-limit widgets, so its exports mirror that tab, not the CO2 one.
                 x0_pkfp_t_exp, x1_pkfp_t_exp = render_x_controls("pkfp_t", t0, t1, stage_defs)
                 y_range_pkfp_t_exp = None
-                if bool(st.session_state.get("pkfp_t__use_fixed_y", False)):
+                if bool(st.session_state.get("pkfp_t__use_fixed_y", True)):
                     y_range_pkfp_t_exp = (
                         float(st.session_state.get("pkfp_t__y_min", 10.0)),
                         float(st.session_state.get("pkfp_t__y_max", 35.0)),
