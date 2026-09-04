@@ -3774,72 +3774,123 @@ def _lam_titles(cfg: AppConfig, src_label: str, rcv_label: str) -> Tuple[str, st
     )
 
 
-def plot_dc_overview_plotly(ex_other, ex_solve, t_lo, t_hi, stage_defs, win_t0, win_t1,
-                            cfg: AppConfig, other_label: str, solve_label: str):
-    """|ΔC| across the whole recording, with every logged stage shaded the way
-    the other charts shade them and the chosen analysis window outlined on top.
-    A map of the experiment: where the gradient is, which stage it sits in,
-    and which stretch the sections below are about to work on."""
+def resolve_fit_window(ex_drive, ex_solve, t_a, t_b, cfg: AppConfig) -> Dict[str, Any]:
+    """The |ΔC| threshold for a window and the stretch of it the λ fit will use.
+
+    In relative mode the threshold is a fraction of the largest gradient seen
+    inside the window - the start of a decay, the crest of a rise - floored so
+    it cannot chase ΔC to zero. The fit then keeps the longest unbroken run
+    where |ΔC| stays at or above it and keeps one sign."""
+    pk_idx = ex_drive.dropna().index.intersection(ex_solve.dropna().index)
+    pk_idx = pk_idx[(pk_idx >= pd.Timestamp(t_a)) & (pk_idx <= pd.Timestamp(t_b))]
+    dc_peak = float((ex_drive.reindex(pk_idx) - ex_solve.reindex(pk_idx)).abs().max()) if len(pk_idx) else np.nan
+    if cfg.dc_threshold_mode == "off":
+        dc_thresh, note = 0.0, "off"
+    elif cfg.dc_threshold_mode == "relative" and np.isfinite(dc_peak):
+        dc_thresh = max(cfg.dc_frac * dc_peak, cfg.dc_floor_ppm)
+        note = (f"{cfg.dc_frac:.0%} of peak |ΔC| {dc_peak:.0f} ppm"
+                + (f", floored at {cfg.dc_floor_ppm:.0f} ppm" if cfg.dc_frac * dc_peak < cfg.dc_floor_ppm else ""))
+    else:
+        dc_thresh, note = cfg.dc_min_ppm, "absolute"
+
+    if cfg.dc_threshold_mode == "off":
+        idx_fit = pk_idx
+        dC_fit = (ex_drive.reindex(idx_fit) - ex_solve.reindex(idx_fit)).astype(float)
+        flips = int((np.sign(dC_fit.to_numpy()[1:]) != np.sign(dC_fit.to_numpy()[:-1])).sum()) if len(dC_fit) > 1 else 0
+        end_reason = "no threshold — every point in the window is used"
+        if flips:
+            end_reason += f" (ΔC changes sign {flips} times inside it)"
+    else:
+        idx_fit, dC_fit, end_reason = select_exchange_window(ex_drive, ex_solve, t_a, t_b, dc_thresh)
+    return {"pk_idx": pk_idx, "dc_peak": dc_peak, "dc_thresh": dc_thresh, "dc_thresh_note": note,
+            "idx_fit": idx_fit, "dC_fit": dC_fit, "end_reason": end_reason}
+
+
+def _has_window(w) -> bool:
+    return w is not None and w[0] is not None and w[1] is not None
+
+
+def _same_window(a, b) -> bool:
+    return (_has_window(a) and _has_window(b)
+            and pd.Timestamp(a[0]) == pd.Timestamp(b[0]) and pd.Timestamp(a[1]) == pd.Timestamp(b[1]))
+
+
+def _window_bounds(tr_window, fit_window):
+    wins = [w for w in (tr_window, fit_window) if _has_window(w)]
+    if not wins:
+        return None
+    lo = min(pd.Timestamp(w[0]) for w in wins)
+    hi = max(pd.Timestamp(w[1]) for w in wins)
+    pad = (hi - lo) * 0.03
+    return lo - pad, hi + pad
+
+
+def _hhmm(w) -> str:
+    return f"{pd.Timestamp(w[0]):%H:%M}–{pd.Timestamp(w[1]):%H:%M}"
+
+
+def plot_dc_overview_plotly(ex_drive, ex_solve, t_lo, t_hi, stage_defs, cfg: AppConfig,
+                            other_label: str, solve_label: str, *,
+                            tr_window=None, fit_window=None, idx_fit=None,
+                            dc_thresh: float = np.nan, dc_peak: float = np.nan,
+                            thresh_note: str = "", zoom: bool = False):
+    """The one map of the experiment: |ΔC| over the whole recording, every
+    logged stage shaded as on the other charts, the window(s) the sections
+    below work on outlined, and on top of that what the λ fit will actually
+    use - the threshold, the peak it is measured from, and the stretch kept.
+    Everything is a legend entry rather than an annotation so nothing overlaps."""
     _require_plotly()
-    idx = ex_other.dropna().index.intersection(ex_solve.dropna().index)
+    idx = ex_drive.dropna().index.intersection(ex_solve.dropna().index)
     idx = idx[(idx >= pd.Timestamp(t_lo)) & (idx <= pd.Timestamp(t_hi))]
-    dc = (ex_other.reindex(idx) - ex_solve.reindex(idx)).astype(float)
+    adc = (ex_drive.reindex(idx) - ex_solve.reindex(idx)).astype(float).abs()
+    ytop = (float(adc.max()) if len(adc) and np.isfinite(adc.max()) else 1.0) * 1.06
     fig = go.Figure()
     fig.add_trace(go.Scatter(
-        x=idx, y=dc.abs().values, mode="lines",
-        name=f"|ΔC| = |{other_label}_ex − {solve_label}_ex|",
-        line=dict(width=2),
+        x=idx, y=adc.values, mode="lines",
+        name=f"|ΔC| = |{other_label}_ex − {solve_label}_ex|", line=dict(width=2),
         hovertemplate="t=%{x|%Y-%m-%d %H:%M}<br>|ΔC|=%{y:.1f} ppm<extra></extra>",
     ))
     add_plotly_stage_vrects(fig, stage_defs)
-    if win_t0 is not None and win_t1 is not None:
-        fig.add_vrect(x0=pd.Timestamp(win_t0), x1=pd.Timestamp(win_t1),
-                      fillcolor="green", opacity=0.10, line_width=2, line_dash="dot", line_color="green",
-                      annotation_text="analysis window", annotation_position="top left")
+
+    def _rect(win, name, colour=None, dash=None, fill=None):
+        a, b = pd.Timestamp(win[0]), pd.Timestamp(win[1])
+        kw = dict(x=[a, b, b, a, a], y=[0, 0, ytop, ytop, 0], mode="lines", name=name, hoverinfo="skip")
+        if fill is None:
+            kw["line"] = dict(color=colour, width=2, dash=dash)
+        else:
+            kw.update(fill="toself", fillcolor=fill, line=dict(width=0))
+        fig.add_trace(go.Scatter(**kw))
+
+    if _same_window(tr_window, fit_window):
+        _rect(fit_window, f"analysis window — ratio + λ ({_hhmm(fit_window)})", "#009E73", "dot")
+    else:
+        if _has_window(tr_window):
+            _rect(tr_window, f"ratio window — section 4 ({_hhmm(tr_window)})", "#0072B2", "dash")
+        if _has_window(fit_window):
+            _rect(fit_window, f"λ window — section 5 ({_hhmm(fit_window)})", "#009E73", "dot")
+    if idx_fit is not None and len(idx_fit):
+        _rect((idx_fit[0], idx_fit[-1]), f"used for the λ fit ({_hhmm((idx_fit[0], idx_fit[-1]))})",
+              fill="rgba(0,158,115,0.18)")
+    if np.isfinite(dc_thresh) and dc_thresh > 0 and len(idx):
+        fig.add_trace(go.Scatter(x=[idx[0], idx[-1]], y=[dc_thresh, dc_thresh], mode="lines", hoverinfo="skip",
+                                 line=dict(color="black", width=2, dash="dash"),
+                                 name=f"threshold {dc_thresh:.0f} ppm ({thresh_note})"))
+    if np.isfinite(dc_peak) and len(adc):
+        fig.add_trace(go.Scatter(x=[adc.idxmax()], y=[dc_peak], mode="markers", hoverinfo="skip",
+                                 marker=dict(size=11, symbol="diamond", color="#D55E00"),
+                                 name=f"peak |ΔC| {dc_peak:.0f} ppm"))
     fig.update_layout(
-        title=f"{cfg.exp_code} — |ΔC| over the whole recording, with stages",
-        xaxis_title="Time", yaxis_title=f"|ΔC| (ppm)",
-        template="plotly_white", height=380,
+        title=f"{cfg.exp_code} — |ΔC| over the whole recording: stages, analysis window, threshold",
+        xaxis_title="Time", yaxis_title="|ΔC| (ppm)",
+        template="plotly_white", height=420,
         margin=dict(l=45, r=20, t=60, b=45),
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
     )
-    return fig
-
-
-def plot_dc_window_plotly(ex_drive, ex_solve, t0, t1, idx_fit, dc_thresh, dc_peak,
-                          mode_note: str, cfg: AppConfig, other_label: str, solve_label: str):
-    """|ΔC| across the whole selected window, with the threshold and the stretch
-    the fit actually used. This is the auto-detection made visible: what was
-    kept, what was left out, and the single number that decided it."""
-    _require_plotly()
-    idx = ex_drive.dropna().index.intersection(ex_solve.dropna().index)
-    idx = idx[(idx >= pd.Timestamp(t0)) & (idx <= pd.Timestamp(t1))]
-    dc = (ex_drive.reindex(idx) - ex_solve.reindex(idx)).astype(float)
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(
-        x=idx, y=dc.abs().values, mode="lines", name=f"|ΔC| = |{other_label}_ex − {solve_label}_ex|",
-        line=dict(width=2),
-        hovertemplate="t=%{x|%H:%M:%S}<br>|ΔC|=%{y:.1f} ppm<extra></extra>",
-    ))
-    if len(idx_fit):
-        fig.add_vrect(x0=idx_fit[0], x1=idx_fit[-1], fillcolor="green", opacity=0.12, line_width=0,
-                      annotation_text="used for the fit", annotation_position="top left")
-    if np.isfinite(dc_thresh) and dc_thresh > 0:
-        fig.add_hline(y=dc_thresh, line_dash="dash", line_width=2,
-                      annotation_text=f"threshold {dc_thresh:.0f} ppm ({mode_note})", annotation_position="top right")
-    if np.isfinite(dc_peak) and len(dc):
-        t_peak = dc.abs().idxmax()
-        fig.add_trace(go.Scatter(x=[t_peak], y=[dc_peak], mode="markers+text", name="peak",
-                                 marker=dict(size=10, symbol="diamond"),
-                                 text=[f"peak {dc_peak:.0f} ppm"], textposition="top center",
-                                 hoverinfo="skip"))
-    fig.update_layout(
-        title=f"{cfg.exp_code} — |ΔC| over the selected window: what the threshold keeps",
-        xaxis_title="Time", yaxis_title=f"|ΔC| (ppm)",
-        template="plotly_white", height=380,
-        margin=dict(l=45, r=20, t=60, b=45),
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
-    )
+    fig.update_yaxes(range=[-ytop * 0.02, ytop * 1.02])
+    if zoom:
+        xr = _window_bounds(tr_window, fit_window)
+        if xr is not None:
+            fig.update_xaxes(range=[xr[0], xr[1]])
     return fig
 
 
@@ -3936,59 +3987,48 @@ def _lam_export_axes(figsize=(9.0, 6.0)):
     return fig, ax
 
 
-def plot_dc_overview_export(ex_other, ex_solve, t_lo, t_hi, stage_defs, win_t0, win_t1,
-                            cfg: AppConfig, other_label: str, solve_label: str):
-    """Report-ready twin of plot_dc_overview_plotly: |ΔC| over the whole
-    recording, every stage shaded, the analysis window boxed. No title,
-    external legend, like the other export figures."""
-    fs_axis = 16
-    idx = ex_other.dropna().index.intersection(ex_solve.dropna().index)
-    idx = idx[(idx >= pd.Timestamp(t_lo)) & (idx <= pd.Timestamp(t_hi))]
-    dc = (ex_other.reindex(idx) - ex_solve.reindex(idx)).astype(float)
-    fig, ax = _lam_export_axes(figsize=(12.0, 5.0))
-    ax.plot(idx, dc.abs().values, "-", lw=2.2, label=f"|ΔC| = |{other_label}_ex − {solve_label}_ex|")
-    patches: List[Any] = []
-    add_stage_shading(ax, stage_defs or [], patches)
-    if win_t0 is not None and win_t1 is not None:
-        _a, _b = pd.Timestamp(win_t0), pd.Timestamp(win_t1)
-        ax.axvspan(_a, _b, facecolor="green", alpha=0.10, zorder=0)
-        for _t in (_a, _b):
-            ax.axvline(_t, color="green", ls=":", lw=2.0)
-        patches.append(Patch(facecolor="green", alpha=0.30, edgecolor="green", linestyle=":",
-                             label="Analysis window"))
-    ax.set_xlabel("Time", fontsize=fs_axis, fontweight="bold")
-    ax.set_ylabel("|ΔC| (ppm)", fontsize=fs_axis, fontweight="bold")
-    ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
-    plt.setp(ax.get_xticklabels(), rotation=45)
-    plt.tight_layout()
-    h, l = ax.get_legend_handles_labels()
-    _export_figlegend(fig, h + patches, l + [p.get_label() for p in patches],
-                      where="bottom", fontsize=13, anchor_ax=ax)
-    return _detach(fig)
-
-
-def plot_dc_window_export(ex_drive, ex_solve, t0, t1, idx_fit, dc_thresh, dc_peak,
-                          mode_note: str, cfg: AppConfig, other_label: str, solve_label: str):
-    """Report-ready twin of plot_dc_window_plotly: |ΔC| across the selected
-    window, the threshold line, the peak, and the stretch the fit used."""
+def plot_dc_overview_export(ex_drive, ex_solve, t_lo, t_hi, stage_defs, cfg: AppConfig,
+                            other_label: str, solve_label: str, *,
+                            tr_window=None, fit_window=None, idx_fit=None,
+                            dc_thresh: float = np.nan, dc_peak: float = np.nan,
+                            thresh_note: str = "", zoom: bool = False):
+    """Report-ready twin of plot_dc_overview_plotly. No title, external legend."""
     fs_axis = 16
     idx = ex_drive.dropna().index.intersection(ex_solve.dropna().index)
-    idx = idx[(idx >= pd.Timestamp(t0)) & (idx <= pd.Timestamp(t1))]
-    dc = (ex_drive.reindex(idx) - ex_solve.reindex(idx)).astype(float)
+    idx = idx[(idx >= pd.Timestamp(t_lo)) & (idx <= pd.Timestamp(t_hi))]
+    adc = (ex_drive.reindex(idx) - ex_solve.reindex(idx)).astype(float).abs()
     fig, ax = _lam_export_axes(figsize=(12.0, 5.0))
-    ax.plot(idx, dc.abs().values, "-", lw=2.2, label=f"|ΔC| = |{other_label}_ex − {solve_label}_ex|")
+    ax.plot(idx, adc.values, "-", lw=2.2, label=f"|ΔC| = |{other_label}_ex − {solve_label}_ex|")
     patches: List[Any] = []
-    if len(idx_fit):
-        ax.axvspan(idx_fit[0], idx_fit[-1], facecolor="green", alpha=0.12, zorder=0)
-        patches.append(Patch(facecolor="green", alpha=0.35, label="Used for the fit"))
+    add_stage_shading(ax, stage_defs or [], patches)
+
+    def _box(win, label, colour, ls):
+        for _t in (pd.Timestamp(win[0]), pd.Timestamp(win[1])):
+            ax.axvline(_t, color=colour, ls=ls, lw=2.0)
+        patches.append(Patch(facecolor="none", edgecolor=colour, linestyle=ls, linewidth=2.0, label=label))
+
+    if _same_window(tr_window, fit_window):
+        _box(fit_window, "Analysis window (ratio + λ)", "#009E73", ":")
+    else:
+        if _has_window(tr_window):
+            _box(tr_window, "Ratio window", "#0072B2", "--")
+        if _has_window(fit_window):
+            _box(fit_window, "λ window", "#009E73", ":")
+    if idx_fit is not None and len(idx_fit):
+        ax.axvspan(idx_fit[0], idx_fit[-1], facecolor="#009E73", alpha=0.18, zorder=0)
+        patches.append(Patch(facecolor="#009E73", alpha=0.40, label="Used for the λ fit"))
     if np.isfinite(dc_thresh) and dc_thresh > 0:
-        ax.axhline(dc_thresh, ls="--", lw=2.0, label=f"Threshold {dc_thresh:.0f} ppm ({mode_note})")
-    if np.isfinite(dc_peak) and len(dc):
-        ax.plot([dc.abs().idxmax()], [dc_peak], "D", ms=9, label=f"Peak {dc_peak:.0f} ppm")
+        ax.axhline(dc_thresh, color="black", ls="--", lw=2.0, label=f"Threshold {dc_thresh:.0f} ppm ({thresh_note})")
+    if np.isfinite(dc_peak) and len(adc):
+        ax.plot([adc.idxmax()], [dc_peak], "D", ms=9, color="#D55E00", label=f"Peak |ΔC| {dc_peak:.0f} ppm")
     ax.set_xlabel("Time", fontsize=fs_axis, fontweight="bold")
     ax.set_ylabel("|ΔC| (ppm)", fontsize=fs_axis, fontweight="bold")
     ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
     plt.setp(ax.get_xticklabels(), rotation=45)
+    if zoom:
+        xr = _window_bounds(tr_window, fit_window)
+        if xr is not None:
+            ax.set_xlim(xr[0], xr[1])
     plt.tight_layout()
     h, l = ax.get_legend_handles_labels()
     _export_figlegend(fig, h + patches, l + [p.get_label() for p in patches],
@@ -6806,10 +6846,11 @@ with tab_ae:
         # ----------------------------------------------------------------
         st.markdown("### 3 · Analysis window")
         st.write(
-            "One window for the two analyses below. Pick the stage it comes from "
-            f"— Decay by default, Release if there is no Decay — and fine-tune its "
-            "edges if the logged boundaries sit a few minutes off the real onset. Each "
-            "section can still use its own window; a checkbox there overrides this one."
+            "Where the two analyses below look, and what gradient they see. Pick the stage "
+            "— Decay by default, Release if there is no Decay — and fine-tune its edges if "
+            "the logged boundaries sit a few minutes off the real onset. The ratio (section 4) "
+            "and the exchange-rate fit (section 5) both use this window unless you give one of "
+            "them its own here; the chart marks exactly which stretch each section works on."
         )
         win_t0, win_t1, win_note = render_window_picker(
             "ae_win", stage_defs, t0, t1, ("decay", "release"),
@@ -6818,25 +6859,97 @@ with tab_ae:
         )
         if win_t0 is None or win_t1 is None:
             win_t0, win_t1, win_note = t0, t1, "full recording"
-        st.caption(
-            f"Analysis window **{pd.Timestamp(win_t0):%Y-%m-%d %H:%M:%S} → {pd.Timestamp(win_t1):%H:%M:%S}** ({win_note})."
+
+        if st.checkbox("Ratio (section 4) uses a different window", key="ae_tr__override",
+                       help="Untick to keep the ratio on the shared window above."):
+            tr_t0, tr_t1, tr_note = render_window_picker(
+                "ae_tr", stage_defs, t0, t1, ("release", "decay"),
+                stage_help="The ratio is conventionally taken over the release stage, but any "
+                           "stage works.",
+            )
+            if tr_t0 is None or tr_t1 is None:
+                tr_t0, tr_t1, tr_note = win_t0, win_t1, win_note
+        else:
+            tr_t0, tr_t1, tr_note = win_t0, win_t1, win_note + " (shared)"
+
+        if st.checkbox("λ fit (section 5) uses a different window", key="ae_lam__override",
+                       help="Untick to keep the fit on the shared window above."):
+            _fit_t0, _fit_t1, _fit_note = render_window_picker(
+                "ae_lam", stage_defs, t0, t1, ("decay", "release"),
+                stage_help="Decay for a short pulse release; Release for a long continuous "
+                           "one. The model only requires that the solved zone has no internal "
+                           "source, so it works on a rise and on a decay alike.",
+            )
+            if _fit_t0 is None or _fit_t1 is None:
+                _fit_t0, _fit_t1, _fit_note = win_t0, win_t1, win_note
+        else:
+            _fit_t0, _fit_t1, _fit_note = win_t0, win_t1, win_note + " (shared)"
+
+        # Which side of the envelope drives the exchange. The chart, the threshold
+        # and the λ fit all see the same ΔC, so this is decided here, once.
+        _drive_mode = st.radio(
+            f"Driving concentration (ΔC = this − {solve_label}_ex)",
+            options=[f"Bulk (all {other_label} sensors)", "Selected sensor groups"],
+            index=0, key="ae__drive_mode", horizontal=True,
+            help="What drives the solved zone is the concentration at its envelope, "
+                 "which need not equal the other zone's bulk mean when that zone is "
+                 "not well mixed.",
         )
+        _walls_avail = sorted(df_other_inc["wall"].dropna().astype(str).str.strip().unique())
+        _env_set = {w.strip().upper() for w in cfg.envelope_walls}
+        _iface_default = [w for w in _walls_avail if w.upper() in _env_set]
+        _drive_walls: List[str] = []
+        if not _drive_mode.startswith("Bulk"):
+            _drive_walls = st.multiselect(
+                f"{other_label} sensor groups used as the driving concentration",
+                options=_walls_avail,
+                default=_iface_default or _walls_avail,
+                key="ae__drive_walls",
+            )
+            if _iface_default:
+                st.caption(
+                    f"Default **{' + '.join(_iface_default)}** — CAVE-side sensors on the PK "
+                    "exterior wall, so they read the concentration right at the envelope."
+                )
+        if _drive_mode.startswith("Bulk") or not _drive_walls:
+            ex_drive = ex_other_default
+            drive_note = f"{other_label} bulk mean"
+        else:
+            _sub = df_other_inc[df_other_inc["wall"].astype(str).str.strip().isin(_drive_walls)]
+            _n_sub = int(_sub["sensor_number"].nunique())
+            ex_drive = excess_mean_series(_sub, cfg.align_to, max(1, min(cfg.min_sensors, _n_sub)))
+            drive_note = f"{other_label}: {', '.join(_drive_walls)} ({_n_sub} sensors)"
+
+        fw = resolve_fit_window(ex_drive, ex_solve, _fit_t0, _fit_t1, cfg)
+
+        st.caption(
+            f"Ratio window **{pd.Timestamp(tr_t0):%Y-%m-%d %H:%M:%S} → {pd.Timestamp(tr_t1):%H:%M:%S}** ({tr_note}) · "
+            f"λ window **{pd.Timestamp(_fit_t0):%Y-%m-%d %H:%M:%S} → {pd.Timestamp(_fit_t1):%H:%M:%S}** ({_fit_note}) · "
+            f"ΔC driver: {drive_note}."
+        )
+        _zoom = st.checkbox("Zoom to the analysis window", key="ae_win__zoom",
+                            help="Show only the chosen window(s) instead of the whole recording. "
+                                 "The exported figure follows this setting.")
 
         if go is None:
-            st.caption("Plotly is not available; the window overview chart is skipped.")
+            st.caption("Plotly is not available; the analysis-window chart is skipped.")
         else:
             _fig_ov = plot_dc_overview_plotly(
-                ex_other_default, ex_solve, t0, t1, stage_defs, win_t0, win_t1,
-                cfg, other_label, solve_label,
+                ex_drive, ex_solve, t0, t1, stage_defs, cfg, other_label, solve_label,
+                tr_window=(tr_t0, tr_t1), fit_window=(_fit_t0, _fit_t1), idx_fit=fw["idx_fit"],
+                dc_thresh=fw["dc_thresh"], dc_peak=fw["dc_peak"], thresh_note=fw["dc_thresh_note"],
+                zoom=_zoom,
             )
             apply_plotly_style(_fig_ov, _style_ae)
             show_plotly_chart(_fig_ov)
             if stage_defs:
                 render_stage_legend_outside(stage_defs)
         st.caption(
-            f"|ΔC| here is the bulk gradient ({other_label} bulk mean − {solve_label}). Shaded bands are the "
-            "logged stages, coloured as on every other chart; the dotted green box is the window "
-            "chosen above. The chart in section 5 zooms into that box and adds the threshold."
+            "Shaded bands are the logged stages, coloured as on every other chart. The dotted box is "
+            "the window the sections below work on — two boxes if the ratio and the fit use different "
+            "ones. The filled green band is the stretch that actually enters the λ fit: the longest "
+            "unbroken run where |ΔC| stays above the dashed threshold and keeps one sign. Section 5 "
+            "explains how that threshold is set."
         )
 
         st.markdown("---")
@@ -6870,17 +6983,6 @@ with tab_ae:
         _rel_thresh = cfg.noise_sigma_k * _sd_series if np.isfinite(_sd_series) else 0.0
         ex_thresh = max(cfg.abs_ex_thresh, _rel_thresh)
 
-        if st.checkbox("Use a different window for the ratio", key="ae_tr__override",
-                       help="By default the ratio uses the analysis window from section 3."):
-            tr_t0, tr_t1, tr_note = render_window_picker(
-                "ae_tr", stage_defs, t0, t1, ("release", "decay"),
-                stage_help="The ratio is conventionally taken over the release stage, but any "
-                           "stage works.",
-            )
-            if tr_t0 is None or tr_t1 is None:
-                tr_t0, tr_t1, tr_note = win_t0, win_t1, win_note
-        else:
-            tr_t0, tr_t1, tr_note = win_t0, win_t1, win_note + " (shared)"
         st.caption(f"Ratio window **{pd.Timestamp(tr_t0):%Y-%m-%d %H:%M:%S} → {pd.Timestamp(tr_t1):%H:%M:%S}** ({tr_note}).")
 
         tr = compute_transfer_ratio(ex_src_bulk, ex_rcv, ex_thresh, tr_t0, tr_t1)
@@ -6928,6 +7030,24 @@ with tab_ae:
         _full_x = bool(st.session_state.get("ae__full_x", False))
         _auto_y = bool(st.session_state.get("ae__auto_y", True))
 
+        # The axis stops where the ratio does: past the gate there is nothing
+        # to plot, and an empty stretch of window reads as missing data.
+        _io_all = tr["io_ex"]
+        _io_win = _io_all[(_io_all.index >= pd.Timestamp(tr_t0)) & (_io_all.index <= pd.Timestamp(tr_t1))].dropna()
+        _tr_xr = None
+        if len(_io_win) >= 2:
+            _pad = (_io_win.index[-1] - _io_win.index[0]) * 0.03
+            _tr_xr = (_io_win.index[0] - _pad, _io_win.index[-1] + _pad)
+            _cut_head = _io_win.index[0] > pd.Timestamp(tr_t0) + pd.Timedelta(minutes=2)
+            _cut_tail = _io_win.index[-1] < pd.Timestamp(tr_t1) - pd.Timedelta(minutes=2)
+            if _cut_head or _cut_tail:
+                st.caption(
+                    f"Plotted **{_io_win.index[0]:%H:%M} → {_io_win.index[-1]:%H:%M}** only. Outside that "
+                    f"stretch {src_label}_ex sits below the {ex_thresh:.0f} ppm gate, so the ratio is undefined "
+                    "there and the mean above uses just these points. The time axis is trimmed to match — "
+                    "tick **Show full experiment** in Plot options to see the whole window."
+                )
+
         if go is None:
             show_matplotlib_fig(plot_io_ratio(
                 tr["io_ex"], tr["factor"], tr_t0, tr_t1, ae["t_base0"], ae["t_base1"],
@@ -6941,7 +7061,7 @@ with tab_ae:
                 tr["io_ex"], tr["factor"], tr_t0, tr_t1, ae["t_base0"], ae["t_base1"],
                 ex_thresh, cfg, src_label=src_label, rcv_label=rcv_label,
                 window_label="Analysis window",
-                x_range=(t0, t1) if _full_x else None,
+                x_range=(t0, t1) if _full_x else _tr_xr,
                 y_range=None if _auto_y else cfg.ylims["io_ex"],
             )
             apply_plotly_style(fig_io_p, _style_ae)
@@ -6983,47 +7103,6 @@ with tab_ae:
             )
         )
 
-        cA, cB = st.columns([1, 1])
-        with cA:
-            if st.checkbox("Use a different window for λ", key="ae_lam__override",
-                           help="By default the fit uses the analysis window from section 3."):
-                _fit_t0, _fit_t1, _fit_note = render_window_picker(
-                    "ae_lam", stage_defs, t0, t1, ("decay", "release"),
-                    stage_help="Decay for a short pulse release; Release for a long continuous "
-                               "one. The model only requires that the solved zone has no internal "
-                               "source, so it works on a rise and on a decay alike.",
-                )
-                if _fit_t0 is None or _fit_t1 is None:
-                    _fit_t0, _fit_t1, _fit_note = win_t0, win_t1, win_note
-            else:
-                _fit_t0, _fit_t1, _fit_note = win_t0, win_t1, win_note + " (shared)"
-        with cB:
-            _drive_mode = st.radio(
-                "Driving concentration",
-                options=[f"Bulk (all {other_label} sensors)", "Selected sensor groups"],
-                index=0, key="ae__drive_mode",
-                help="What drives the solved zone is the concentration at its envelope, "
-                     "which need not equal the other zone's bulk mean when that zone is "
-                     "not well mixed.",
-            )
-
-        _walls_avail = sorted(df_other_inc["wall"].dropna().astype(str).str.strip().unique())
-        _env_set = {w.strip().upper() for w in cfg.envelope_walls}
-        _iface_default = [w for w in _walls_avail if w.upper() in _env_set]
-        _drive_walls: List[str] = []
-        if not _drive_mode.startswith("Bulk"):
-            _drive_walls = st.multiselect(
-                f"{other_label} sensor groups used as the driving concentration",
-                options=_walls_avail,
-                default=_iface_default or _walls_avail,
-                key="ae__drive_walls",
-            )
-            if _iface_default:
-                st.caption(
-                    f"Default **{' + '.join(_iface_default)}** — CAVE-side sensors on the PK "
-                    "exterior wall, so they read the concentration right at the envelope."
-                )
-
         _fit_ok = False
         if _fit_t0 is None or _fit_t1 is None:
             st.warning(
@@ -7031,44 +7110,9 @@ with tab_ae:
             )
         else:
             _sname, _sstart, _send = _fit_note, _fit_t0, _fit_t1
-
-            if _drive_mode.startswith("Bulk") or not _drive_walls:
-                ex_drive = ex_other_default
-                drive_note = f"{other_label} bulk mean"
-            else:
-                _sub = df_other_inc[df_other_inc["wall"].astype(str).str.strip().isin(_drive_walls)]
-                _n_sub = int(_sub["sensor_number"].nunique())
-                ex_drive = excess_mean_series(_sub, cfg.align_to, max(1, min(cfg.min_sensors, _n_sub)))
-                drive_note = f"{other_label}: {', '.join(_drive_walls)} ({_n_sub} sensors)"
-
-            # Resolve the |ΔC| threshold for this stage. In relative mode it is a
-            # fraction of the largest gradient seen in the stage - the start of a
-            # decay, the crest of a rise - floored so it cannot chase ΔC to zero.
-            _pk_idx = ex_drive.dropna().index.intersection(ex_solve.dropna().index)
-            _pk_idx = _pk_idx[(_pk_idx >= pd.Timestamp(_sstart)) & (_pk_idx <= pd.Timestamp(_send))]
-            _dc_peak = float((ex_drive.reindex(_pk_idx) - ex_solve.reindex(_pk_idx)).abs().max()) if len(_pk_idx) else np.nan
-            if cfg.dc_threshold_mode == "off":
-                dc_thresh = 0.0
-                dc_thresh_note = "off"
-            elif cfg.dc_threshold_mode == "relative" and np.isfinite(_dc_peak):
-                dc_thresh = max(cfg.dc_frac * _dc_peak, cfg.dc_floor_ppm)
-                dc_thresh_note = (f"{cfg.dc_frac:.0%} of peak |ΔC| {_dc_peak:.0f} ppm"
-                                  + (f", floored at {cfg.dc_floor_ppm:.0f} ppm" if cfg.dc_frac * _dc_peak < cfg.dc_floor_ppm else ""))
-            else:
-                dc_thresh = cfg.dc_min_ppm
-                dc_thresh_note = "absolute"
-
-            if cfg.dc_threshold_mode == "off":
-                idx_fit = _pk_idx
-                dC_fit = (ex_drive.reindex(idx_fit) - ex_solve.reindex(idx_fit)).astype(float)
-                _flips = int((np.sign(dC_fit.to_numpy()[1:]) != np.sign(dC_fit.to_numpy()[:-1])).sum()) if len(dC_fit) > 1 else 0
-                end_reason = "no threshold — every point in the window is used"
-                if _flips:
-                    end_reason += f" (ΔC changes sign {_flips} times inside it)"
-            else:
-                idx_fit, dC_fit, end_reason = select_exchange_window(
-                    ex_drive, ex_solve, _sstart, _send, dc_thresh
-                )
+            _pk_idx, _dc_peak = fw["pk_idx"], fw["dc_peak"]
+            dc_thresh, dc_thresh_note = fw["dc_thresh"], fw["dc_thresh_note"]
+            idx_fit, dC_fit, end_reason = fw["idx_fit"], fw["dC_fit"], fw["end_reason"]
 
             # What the threshold means, in this experiment's own numbers.
             with st.expander(f"How the fit window is chosen (ΔC threshold)", expanded=False):
@@ -7093,13 +7137,11 @@ with tab_ae:
                     )
                 )
 
-            if len(_pk_idx):
-                _fig_dc = plot_dc_window_plotly(
-                    ex_drive, ex_solve, _sstart, _send, idx_fit, dc_thresh, _dc_peak,
-                    dc_thresh_note, cfg, other_label, solve_label,
-                )
-                apply_plotly_style(_fig_dc, _style_ae)
-                show_plotly_chart(_fig_dc)
+            st.caption(
+                f"Fit window **{pd.Timestamp(_sstart):%H:%M} → {pd.Timestamp(_send):%H:%M}** ({_sname}); "
+                "the stretch actually fitted is the filled green band on the chart in section 3. "
+                f"ΔC driver: {drive_note}."
+            )
 
             if len(idx_fit) < cfg.lam_min_pts_int:
                 st.warning(
@@ -7357,9 +7399,11 @@ with tab_ae:
                     "labels": (src_label, rcv_label),
                     "lam_labels": (other_label, solve_label),
                     "ex_thresh": ex_thresh,
-                    "dc_overview": (ex_other_default, ex_solve, t0, t1, stage_defs, win_t0, win_t1),
-                    "dc_window": (ex_drive, ex_solve, _sstart, _send, idx_fit, dc_thresh, _dc_peak,
-                                  dc_thresh_note),
+                    "dc_overview": dict(
+                        ex_drive=ex_drive, ex_solve=ex_solve, t_lo=t0, t_hi=t1, stage_defs=stage_defs,
+                        tr_window=(tr_t0, tr_t1), fit_window=(_fit_t0, _fit_t1), idx_fit=idx_fit,
+                        dc_thresh=dc_thresh, dc_peak=_dc_peak, thresh_note=dc_thresh_note, zoom=_zoom,
+                    ),
                 }
 
         if not _fit_ok:
@@ -7744,7 +7788,8 @@ with tab8:
                 _w0, _w1 = ae_export["tr_window"]
 
                 _download_row(
-                    plot_dc_overview_export(*ae_export["dc_overview"], cfg, _ae_other, _ae_solve),
+                    plot_dc_overview_export(**ae_export["dc_overview"], cfg=cfg,
+                                            other_label=_ae_other, solve_label=_ae_solve),
                     "dc_overview_stages", "|ΔC| overview with stages",
                 )
                 st.markdown("---")
@@ -7765,12 +7810,6 @@ with tab8:
                     plot_scatter(ae_export["df_sc"], _sl, _ic_, _r2_, cfg,
                                  src_label=_ae_src, rcv_label=_ae_rcv, export_mode=True),
                     "excess_scatter", "excess scatter",
-                )
-                st.markdown("---")
-
-                _download_row(
-                    plot_dc_window_export(*ae_export["dc_window"], cfg, _ae_other, _ae_solve),
-                    "dc_fit_window", "|ΔC| fit window (threshold)",
                 )
                 st.markdown("---")
 
