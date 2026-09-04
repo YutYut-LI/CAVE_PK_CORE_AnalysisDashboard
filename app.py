@@ -3936,6 +3936,66 @@ def _lam_export_axes(figsize=(9.0, 6.0)):
     return fig, ax
 
 
+def plot_dc_overview_export(ex_other, ex_solve, t_lo, t_hi, stage_defs, win_t0, win_t1,
+                            cfg: AppConfig, other_label: str, solve_label: str):
+    """Report-ready twin of plot_dc_overview_plotly: |ΔC| over the whole
+    recording, every stage shaded, the analysis window boxed. No title,
+    external legend, like the other export figures."""
+    fs_axis = 16
+    idx = ex_other.dropna().index.intersection(ex_solve.dropna().index)
+    idx = idx[(idx >= pd.Timestamp(t_lo)) & (idx <= pd.Timestamp(t_hi))]
+    dc = (ex_other.reindex(idx) - ex_solve.reindex(idx)).astype(float)
+    fig, ax = _lam_export_axes(figsize=(12.0, 5.0))
+    ax.plot(idx, dc.abs().values, "-", lw=2.2, label=f"|ΔC| = |{other_label}_ex − {solve_label}_ex|")
+    patches: List[Any] = []
+    add_stage_shading(ax, stage_defs or [], patches)
+    if win_t0 is not None and win_t1 is not None:
+        _a, _b = pd.Timestamp(win_t0), pd.Timestamp(win_t1)
+        ax.axvspan(_a, _b, facecolor="green", alpha=0.10, zorder=0)
+        for _t in (_a, _b):
+            ax.axvline(_t, color="green", ls=":", lw=2.0)
+        patches.append(Patch(facecolor="green", alpha=0.30, edgecolor="green", linestyle=":",
+                             label="Analysis window"))
+    ax.set_xlabel("Time", fontsize=fs_axis, fontweight="bold")
+    ax.set_ylabel("|ΔC| (ppm)", fontsize=fs_axis, fontweight="bold")
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
+    plt.setp(ax.get_xticklabels(), rotation=45)
+    plt.tight_layout()
+    h, l = ax.get_legend_handles_labels()
+    _export_figlegend(fig, h + patches, l + [p.get_label() for p in patches],
+                      where="bottom", fontsize=13, anchor_ax=ax)
+    return _detach(fig)
+
+
+def plot_dc_window_export(ex_drive, ex_solve, t0, t1, idx_fit, dc_thresh, dc_peak,
+                          mode_note: str, cfg: AppConfig, other_label: str, solve_label: str):
+    """Report-ready twin of plot_dc_window_plotly: |ΔC| across the selected
+    window, the threshold line, the peak, and the stretch the fit used."""
+    fs_axis = 16
+    idx = ex_drive.dropna().index.intersection(ex_solve.dropna().index)
+    idx = idx[(idx >= pd.Timestamp(t0)) & (idx <= pd.Timestamp(t1))]
+    dc = (ex_drive.reindex(idx) - ex_solve.reindex(idx)).astype(float)
+    fig, ax = _lam_export_axes(figsize=(12.0, 5.0))
+    ax.plot(idx, dc.abs().values, "-", lw=2.2, label=f"|ΔC| = |{other_label}_ex − {solve_label}_ex|")
+    patches: List[Any] = []
+    if len(idx_fit):
+        ax.axvspan(idx_fit[0], idx_fit[-1], facecolor="green", alpha=0.12, zorder=0)
+        patches.append(Patch(facecolor="green", alpha=0.35, label="Used for the fit"))
+    if np.isfinite(dc_thresh) and dc_thresh > 0:
+        ax.axhline(dc_thresh, ls="--", lw=2.0, label=f"Threshold {dc_thresh:.0f} ppm ({mode_note})")
+    if np.isfinite(dc_peak) and len(dc):
+        ax.plot([dc.abs().idxmax()], [dc_peak], "D", ms=9, label=f"Peak {dc_peak:.0f} ppm")
+    ax.set_xlabel("Time", fontsize=fs_axis, fontweight="bold")
+    ax.set_ylabel("|ΔC| (ppm)", fontsize=fs_axis, fontweight="bold")
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
+    plt.setp(ax.get_xticklabels(), rotation=45)
+    plt.tight_layout()
+    h, l = ax.get_legend_handles_labels()
+    _export_figlegend(fig, h + patches, l + [p.get_label() for p in patches],
+                      where="bottom", fontsize=13, anchor_ax=ax)
+    return _detach(fig)
+
+
 def plot_lambda_integrated_export(res, cfg: AppConfig, other_label: str, solve_label: str):
     """Report-ready integrated-method figure: no title, external legend."""
     fs_axis = 16
@@ -7297,6 +7357,9 @@ with tab_ae:
                     "labels": (src_label, rcv_label),
                     "lam_labels": (other_label, solve_label),
                     "ex_thresh": ex_thresh,
+                    "dc_overview": (ex_other_default, ex_solve, t0, t1, stage_defs, win_t0, win_t1),
+                    "dc_window": (ex_drive, ex_solve, _sstart, _send, idx_fit, dc_thresh, _dc_peak,
+                                  dc_thresh_note),
                 }
 
         if not _fit_ok:
@@ -7681,6 +7744,12 @@ with tab8:
                 _w0, _w1 = ae_export["tr_window"]
 
                 _download_row(
+                    plot_dc_overview_export(*ae_export["dc_overview"], cfg, _ae_other, _ae_solve),
+                    "dc_overview_stages", "|ΔC| overview with stages",
+                )
+                st.markdown("---")
+
+                _download_row(
                     plot_io_ratio(
                         ae_export["tr"]["io_ex"], ae_export["tr"]["factor"], _w0, _w1,
                         ae["t_base0"], ae["t_base1"], ae_export["ex_thresh"], cfg,
@@ -7696,6 +7765,12 @@ with tab8:
                     plot_scatter(ae_export["df_sc"], _sl, _ic_, _r2_, cfg,
                                  src_label=_ae_src, rcv_label=_ae_rcv, export_mode=True),
                     "excess_scatter", "excess scatter",
+                )
+                st.markdown("---")
+
+                _download_row(
+                    plot_dc_window_export(*ae_export["dc_window"], cfg, _ae_other, _ae_solve),
+                    "dc_fit_window", "|ΔC| fit window (threshold)",
                 )
                 st.markdown("---")
 
