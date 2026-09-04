@@ -3774,6 +3774,38 @@ def _lam_titles(cfg: AppConfig, src_label: str, rcv_label: str) -> Tuple[str, st
     )
 
 
+def plot_dc_overview_plotly(ex_other, ex_solve, t_lo, t_hi, stage_defs, win_t0, win_t1,
+                            cfg: AppConfig, other_label: str, solve_label: str):
+    """|ΔC| across the whole recording, with every logged stage shaded the way
+    the other charts shade them and the chosen analysis window outlined on top.
+    A map of the experiment: where the gradient is, which stage it sits in,
+    and which stretch the sections below are about to work on."""
+    _require_plotly()
+    idx = ex_other.dropna().index.intersection(ex_solve.dropna().index)
+    idx = idx[(idx >= pd.Timestamp(t_lo)) & (idx <= pd.Timestamp(t_hi))]
+    dc = (ex_other.reindex(idx) - ex_solve.reindex(idx)).astype(float)
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=idx, y=dc.abs().values, mode="lines",
+        name=f"|ΔC| = |{other_label}_ex − {solve_label}_ex|",
+        line=dict(width=2),
+        hovertemplate="t=%{x|%Y-%m-%d %H:%M}<br>|ΔC|=%{y:.1f} ppm<extra></extra>",
+    ))
+    add_plotly_stage_vrects(fig, stage_defs)
+    if win_t0 is not None and win_t1 is not None:
+        fig.add_vrect(x0=pd.Timestamp(win_t0), x1=pd.Timestamp(win_t1),
+                      fillcolor="green", opacity=0.10, line_width=2, line_dash="dot", line_color="green",
+                      annotation_text="analysis window", annotation_position="top left")
+    fig.update_layout(
+        title=f"{cfg.exp_code} — |ΔC| over the whole recording, with stages",
+        xaxis_title="Time", yaxis_title=f"|ΔC| (ppm)",
+        template="plotly_white", height=380,
+        margin=dict(l=45, r=20, t=60, b=45),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+    )
+    return fig
+
+
 def plot_dc_window_plotly(ex_drive, ex_solve, t0, t1, idx_fit, dc_thresh, dc_peak,
                           mode_note: str, cfg: AppConfig, other_label: str, solve_label: str):
     """|ΔC| across the whole selected window, with the threshold and the stretch
@@ -6582,8 +6614,8 @@ with tab_ae:
             "during the baseline window by construction, so roughly half the baseline points are "
             "negative; that is noise around zero and is never clipped, because clipping a symmetric "
             "noise would bias the mean upward.\n\n"
-            "Everything downstream is built from these two series: the ratio in section 3, and "
-            "ΔC in section 4. Note that per-sensor and per-region baselines are equivalent as long as "
+            "Everything downstream is built from these two series: the ratio in section 4, and "
+            "ΔC in section 5. Note that per-sensor and per-region baselines are equivalent as long as "
             "the same sensors report throughout — the per-sensor form is used because it also survives "
             "sensors dropping in and out."
         )
@@ -6635,7 +6667,7 @@ with tab_ae:
                 "**Tracer released into CAVE — this is an infiltration experiment.** CAVE plays the "
                 "part of the outdoor environment and PK the building. The question is how much of "
                 "what is outside gets in, and how fast. PK fills up, so ΔC = CAVE_ex − PK_ex is "
-                "**positive** and the ratio in section 3 is a genuine **infiltration factor**."
+                "**positive** and the ratio in section 4 is a genuine **infiltration factor**."
             )
         else:
             src_label, rcv_label = "PK", "CAVE"
@@ -6644,7 +6676,7 @@ with tab_ae:
             st.success(
                 "**Tracer released inside PK — this is an emission / decay experiment.** The question "
                 "is the reverse one: how fast something released indoors clears out. PK empties, so "
-                "ΔC = CAVE_ex − PK_ex is **negative** throughout, and section 3 measures "
+                "ΔC = CAVE_ex − PK_ex is **negative** throughout, and section 4 measures "
                 "**exfiltration / dilution — not an infiltration factor**, even though the arithmetic "
                 "is identical.\n\n"
                 "Two things behave differently in this direction. CAVE is 3.2× the volume and is "
@@ -6707,11 +6739,52 @@ with tab_ae:
 
         st.markdown("---")
 
-        # ----------------------------------------------------------------
-        # 3) Transfer ratio
-        # ----------------------------------------------------------------
         _ratio_name = "Infiltration factor" if direction == DIR_CAVE_TO_PK else "Exfiltration / dilution ratio"
-        st.markdown(f"### 3 · {_ratio_name}  ({rcv_label}_ex / {src_label}_ex)")
+        _style_ae = _style_from_prefix("ae")  # seeded by _ensure_widget_defaults above; styles every chart from here on
+        # ----------------------------------------------------------------
+        # 3) Analysis window (shared by the ratio and the exchange-rate fit)
+        # ----------------------------------------------------------------
+        st.markdown("### 3 · Analysis window")
+        st.write(
+            "One window for the two analyses below. Pick the stage it comes from "
+            f"— Decay by default, Release if there is no Decay — and fine-tune its "
+            "edges if the logged boundaries sit a few minutes off the real onset. Each "
+            "section can still use its own window; a checkbox there overrides this one."
+        )
+        win_t0, win_t1, win_note = render_window_picker(
+            "ae_win", stage_defs, t0, t1, ("decay", "release"),
+            stage_help="The stage both analyses work on. Decay for a pulse release; Release "
+                       "for a long continuous one.",
+        )
+        if win_t0 is None or win_t1 is None:
+            win_t0, win_t1, win_note = t0, t1, "full recording"
+        st.caption(
+            f"Analysis window **{pd.Timestamp(win_t0):%Y-%m-%d %H:%M:%S} → {pd.Timestamp(win_t1):%H:%M:%S}** ({win_note})."
+        )
+
+        if go is None:
+            st.caption("Plotly is not available; the window overview chart is skipped.")
+        else:
+            _fig_ov = plot_dc_overview_plotly(
+                ex_other_default, ex_solve, t0, t1, stage_defs, win_t0, win_t1,
+                cfg, other_label, solve_label,
+            )
+            apply_plotly_style(_fig_ov, _style_ae)
+            show_plotly_chart(_fig_ov)
+            if stage_defs:
+                render_stage_legend_outside(stage_defs)
+        st.caption(
+            f"|ΔC| here is the bulk gradient ({other_label} bulk mean − {solve_label}). Shaded bands are the "
+            "logged stages, coloured as on every other chart; the dotted green box is the window "
+            "chosen above. The chart in section 5 zooms into that box and adds the threshold."
+        )
+
+        st.markdown("---")
+
+        # ----------------------------------------------------------------
+        # 4) Transfer ratio
+        # ----------------------------------------------------------------
+        st.markdown(f"### 4 · {_ratio_name}  ({rcv_label}_ex / {src_label}_ex)")
         st.latex(
             r"\text{ratio}(t) = \frac{\text{" + rcv_label + r"\_ex}(t)}{\text{" + src_label
             + r"\_ex}(t)} \quad\text{for}\quad \text{" + src_label + r"\_ex}(t) > \varepsilon"
@@ -6737,13 +6810,17 @@ with tab_ae:
         _rel_thresh = cfg.noise_sigma_k * _sd_series if np.isfinite(_sd_series) else 0.0
         ex_thresh = max(cfg.abs_ex_thresh, _rel_thresh)
 
-        tr_t0, tr_t1, tr_note = render_window_picker(
-            "ae_tr", stage_defs, t0, t1, ("release",),
-            stage_help="The ratio is conventionally taken over the release stage, but any "
-                       "stage works — and Manual lets you set the window by eye.",
-        )
-        if tr_t0 is None or tr_t1 is None:
-            tr_t0, tr_t1, tr_note = t_rel0, t_rel1, "fallback: release window"
+        if st.checkbox("Use a different window for the ratio", key="ae_tr__override",
+                       help="By default the ratio uses the analysis window from section 3."):
+            tr_t0, tr_t1, tr_note = render_window_picker(
+                "ae_tr", stage_defs, t0, t1, ("release", "decay"),
+                stage_help="The ratio is conventionally taken over the release stage, but any "
+                           "stage works.",
+            )
+            if tr_t0 is None or tr_t1 is None:
+                tr_t0, tr_t1, tr_note = win_t0, win_t1, win_note
+        else:
+            tr_t0, tr_t1, tr_note = win_t0, win_t1, win_note + " (shared)"
         st.caption(f"Ratio window **{pd.Timestamp(tr_t0):%Y-%m-%d %H:%M:%S} → {pd.Timestamp(tr_t1):%H:%M:%S}** ({tr_note}).")
 
         tr = compute_transfer_ratio(ex_src_bulk, ex_rcv, ex_thresh, tr_t0, tr_t1)
@@ -6779,7 +6856,7 @@ with tab_ae:
             st.warning(
                 f"Only **{tr['n']}** points survive the threshold inside this window. "
                 "For a short pulse release the receiving zone has barely started to respond, so "
-                "the ratio says almost nothing about the exchange — read λ in section 4 instead."
+                "the ratio says almost nothing about the exchange — read λ in section 5 instead."
             )
 
         with st.expander("Plot options — transfer ratio", expanded=False):
@@ -6790,7 +6867,6 @@ with tab_ae:
 
         _full_x = bool(st.session_state.get("ae__full_x", False))
         _auto_y = bool(st.session_state.get("ae__auto_y", True))
-        _style_ae = _style_from_prefix("ae")
 
         if go is None:
             show_matplotlib_fig(plot_io_ratio(
@@ -6823,7 +6899,7 @@ with tab_ae:
         # ----------------------------------------------------------------
         # 4) Exchange rate lambda
         # ----------------------------------------------------------------
-        st.markdown(f"### 4 · Exchange rate λ_{solve_label}")
+        st.markdown(f"### 5 · Exchange rate λ_{solve_label}")
         st.latex(
             r"\frac{d\,\text{" + solve_label + r"\_ex}}{dt} = \lambda \cdot \Delta C, \qquad"
             r"\Delta C = \text{" + other_label + r"\_ex} - \text{" + solve_label + r"\_ex}, \qquad"
@@ -6849,12 +6925,18 @@ with tab_ae:
 
         cA, cB = st.columns([1, 1])
         with cA:
-            _fit_t0, _fit_t1, _fit_note = render_window_picker(
-                "ae_lam", stage_defs, t0, t1, ("decay", "release"),
-                stage_help="Decay for a short pulse release; Release for a long continuous "
-                           "one. The model only requires that the solved zone has no internal "
-                           "source, so it works on a rise and on a decay alike.",
-            )
+            if st.checkbox("Use a different window for λ", key="ae_lam__override",
+                           help="By default the fit uses the analysis window from section 3."):
+                _fit_t0, _fit_t1, _fit_note = render_window_picker(
+                    "ae_lam", stage_defs, t0, t1, ("decay", "release"),
+                    stage_help="Decay for a short pulse release; Release for a long continuous "
+                               "one. The model only requires that the solved zone has no internal "
+                               "source, so it works on a rise and on a decay alike.",
+                )
+                if _fit_t0 is None or _fit_t1 is None:
+                    _fit_t0, _fit_t1, _fit_note = win_t0, win_t1, win_note
+            else:
+                _fit_t0, _fit_t1, _fit_note = win_t0, win_t1, win_note + " (shared)"
         with cB:
             _drive_mode = st.radio(
                 "Driving concentration",
@@ -7090,7 +7172,7 @@ with tab_ae:
                 # 5) Q conversion and equilibrium check
                 # --------------------------------------------------------
                 st.markdown("---")
-                st.markdown("### 5 · Exchange flow Q and result summary")
+                st.markdown("### 6 · Exchange flow Q and result summary")
 
                 lam_ref = res_int["lam_h"]
                 Q = lam_ref * v_solve if np.isfinite(lam_ref) else np.nan
@@ -7129,7 +7211,7 @@ with tab_ae:
                 if np.isfinite(_equil) and _equil < 0.95:
                     _msg = (
                         f"The release lasted **{_rel_h / tau_h:.2f} τ**, so the transfer ratio in "
-                        "section 3 is a **transient** value that still depends on release duration. "
+                        "section 4 is a **transient** value that still depends on release duration. "
                         "It is not a steady-state penetration factor and is only comparable across "
                         "experiments of equal release duration."
                     )
