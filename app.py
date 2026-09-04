@@ -3694,8 +3694,10 @@ def plot_io_ratio_plotly(io_ex, infiltration_factor, t_rel0, t_rel1, t_base0, t_
 
     if y_range is not None:
         fig.update_yaxes(range=list(y_range))
-    elif cfg.use_fixed_ylims:
-        fig.update_yaxes(range=list(cfg.ylims["io_ex"]))
+    else:
+        # Auto-scale: fit the data but always keep zero in view, so a ratio of
+        # 0.05 is readable and a negative early stretch is not silently cut off.
+        fig.update_yaxes(autorange=True, rangemode="tozero")
 
     # Threshold note (as annotation)
     fig.add_annotation(
@@ -3783,7 +3785,9 @@ def resolve_fit_window(ex_drive, ex_solve, t_a, t_b, cfg: AppConfig) -> Dict[str
     where |ΔC| stays at or above it and keeps one sign."""
     pk_idx = ex_drive.dropna().index.intersection(ex_solve.dropna().index)
     pk_idx = pk_idx[(pk_idx >= pd.Timestamp(t_a)) & (pk_idx <= pd.Timestamp(t_b))]
-    dc_peak = float((ex_drive.reindex(pk_idx) - ex_solve.reindex(pk_idx)).abs().max()) if len(pk_idx) else np.nan
+    _adc = (ex_drive.reindex(pk_idx) - ex_solve.reindex(pk_idx)).astype(float).abs()
+    dc_peak = float(_adc.max()) if len(pk_idx) else np.nan
+    dc_peak_time = _adc.idxmax() if len(pk_idx) and np.isfinite(dc_peak) else None
     if cfg.dc_threshold_mode == "off":
         dc_thresh, note = 0.0, "off"
     elif cfg.dc_threshold_mode == "relative" and np.isfinite(dc_peak):
@@ -3802,7 +3806,8 @@ def resolve_fit_window(ex_drive, ex_solve, t_a, t_b, cfg: AppConfig) -> Dict[str
             end_reason += f" (ΔC changes sign {flips} times inside it)"
     else:
         idx_fit, dC_fit, end_reason = select_exchange_window(ex_drive, ex_solve, t_a, t_b, dc_thresh)
-    return {"pk_idx": pk_idx, "dc_peak": dc_peak, "dc_thresh": dc_thresh, "dc_thresh_note": note,
+    return {"pk_idx": pk_idx, "dc_peak": dc_peak, "dc_peak_time": dc_peak_time,
+            "dc_thresh": dc_thresh, "dc_thresh_note": note,
             "idx_fit": idx_fit, "dC_fit": dC_fit, "end_reason": end_reason}
 
 
@@ -3825,6 +3830,18 @@ def _window_bounds(tr_window, fit_window):
     return lo - pad, hi + pad
 
 
+def _peak_x(adc, fit_window, dc_peak_time):
+    """Time of the peak marker: the value the caller resolved if given, else
+    the largest |ΔC| inside the fit window - never the whole recording's
+    maximum, which can sit outside a hand-trimmed window and misplace it."""
+    if dc_peak_time is not None:
+        return pd.Timestamp(dc_peak_time)
+    sub = adc
+    if _has_window(fit_window):
+        sub = adc[(adc.index >= pd.Timestamp(fit_window[0])) & (adc.index <= pd.Timestamp(fit_window[1]))]
+    return sub.idxmax() if len(sub) else None
+
+
 def _hhmm(w) -> str:
     return f"{pd.Timestamp(w[0]):%H:%M}–{pd.Timestamp(w[1]):%H:%M}"
 
@@ -3833,7 +3850,7 @@ def plot_dc_overview_plotly(ex_drive, ex_solve, t_lo, t_hi, stage_defs, cfg: App
                             other_label: str, solve_label: str, *,
                             tr_window=None, fit_window=None, idx_fit=None,
                             dc_thresh: float = np.nan, dc_peak: float = np.nan,
-                            thresh_note: str = "", zoom: bool = False):
+                            thresh_note: str = "", zoom: bool = False, dc_peak_time=None):
     """The one map of the experiment: |ΔC| over the whole recording, every
     logged stage shaded as on the other charts, the window(s) the sections
     below work on outlined, and on top of that what the λ fit will actually
@@ -3875,8 +3892,9 @@ def plot_dc_overview_plotly(ex_drive, ex_solve, t_lo, t_hi, stage_defs, cfg: App
         fig.add_trace(go.Scatter(x=[idx[0], idx[-1]], y=[dc_thresh, dc_thresh], mode="lines", hoverinfo="skip",
                                  line=dict(color="black", width=2, dash="dash"),
                                  name=f"threshold {dc_thresh:.0f} ppm ({thresh_note})"))
-    if np.isfinite(dc_peak) and len(adc):
-        fig.add_trace(go.Scatter(x=[adc.idxmax()], y=[dc_peak], mode="markers", hoverinfo="skip",
+    _px = _peak_x(adc, fit_window, dc_peak_time) if np.isfinite(dc_peak) and len(adc) else None
+    if _px is not None:
+        fig.add_trace(go.Scatter(x=[_px], y=[dc_peak], mode="markers", hoverinfo="skip",
                                  marker=dict(size=11, symbol="diamond", color="#D55E00"),
                                  name=f"peak |ΔC| {dc_peak:.0f} ppm"))
     fig.update_layout(
@@ -3991,7 +4009,7 @@ def plot_dc_overview_export(ex_drive, ex_solve, t_lo, t_hi, stage_defs, cfg: App
                             other_label: str, solve_label: str, *,
                             tr_window=None, fit_window=None, idx_fit=None,
                             dc_thresh: float = np.nan, dc_peak: float = np.nan,
-                            thresh_note: str = "", zoom: bool = False):
+                            thresh_note: str = "", zoom: bool = False, dc_peak_time=None):
     """Report-ready twin of plot_dc_overview_plotly. No title, external legend."""
     fs_axis = 16
     idx = ex_drive.dropna().index.intersection(ex_solve.dropna().index)
@@ -4019,8 +4037,9 @@ def plot_dc_overview_export(ex_drive, ex_solve, t_lo, t_hi, stage_defs, cfg: App
         patches.append(Patch(facecolor="#009E73", alpha=0.40, label="Used for the λ fit"))
     if np.isfinite(dc_thresh) and dc_thresh > 0:
         ax.axhline(dc_thresh, color="black", ls="--", lw=2.0, label=f"Threshold {dc_thresh:.0f} ppm ({thresh_note})")
-    if np.isfinite(dc_peak) and len(adc):
-        ax.plot([adc.idxmax()], [dc_peak], "D", ms=9, color="#D55E00", label=f"Peak |ΔC| {dc_peak:.0f} ppm")
+    _px = _peak_x(adc, fit_window, dc_peak_time) if np.isfinite(dc_peak) and len(adc) else None
+    if _px is not None:
+        ax.plot([_px], [dc_peak], "D", ms=9, color="#D55E00", label=f"Peak |ΔC| {dc_peak:.0f} ppm")
     ax.set_xlabel("Time", fontsize=fs_axis, fontweight="bold")
     ax.set_ylabel("|ΔC| (ppm)", fontsize=fs_axis, fontweight="bold")
     ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
@@ -6940,8 +6959,8 @@ with tab_ae:
             _fig_ov = plot_dc_overview_plotly(
                 ex_drive, ex_solve, t0, t1, stage_defs, cfg, other_label, solve_label,
                 tr_window=(tr_t0, tr_t1), fit_window=(_fit_t0, _fit_t1), idx_fit=fw["idx_fit"],
-                dc_thresh=fw["dc_thresh"], dc_peak=fw["dc_peak"], thresh_note=fw["dc_thresh_note"],
-                zoom=_zoom,
+                dc_thresh=fw["dc_thresh"], dc_peak=fw["dc_peak"], dc_peak_time=fw["dc_peak_time"],
+                thresh_note=fw["dc_thresh_note"], zoom=_zoom,
             )
             # The peak sits at the left of the window on a decay, so this chart's
             # legend is pinned top-right; fonts and columns still follow Plot options.
@@ -7407,7 +7426,8 @@ with tab_ae:
                     "dc_overview": dict(
                         ex_drive=ex_drive, ex_solve=ex_solve, t_lo=t0, t_hi=t1, stage_defs=stage_defs,
                         tr_window=(tr_t0, tr_t1), fit_window=(_fit_t0, _fit_t1), idx_fit=idx_fit,
-                        dc_thresh=dc_thresh, dc_peak=_dc_peak, thresh_note=dc_thresh_note, zoom=_zoom,
+                        dc_thresh=dc_thresh, dc_peak=_dc_peak, dc_peak_time=fw["dc_peak_time"],
+                        thresh_note=dc_thresh_note, zoom=_zoom,
                     ),
                 }
 
