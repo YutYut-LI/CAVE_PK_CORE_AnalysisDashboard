@@ -6940,7 +6940,9 @@ with tab_ae:
                 dc_thresh=fw["dc_thresh"], dc_peak=fw["dc_peak"], thresh_note=fw["dc_thresh_note"],
                 zoom=_zoom,
             )
-            apply_plotly_style(_fig_ov, _style_ae)
+            # The peak sits at the left of the window on a decay, so this chart's
+            # legend is pinned top-right; fonts and columns still follow Plot options.
+            apply_plotly_style(_fig_ov, {**_style_ae, "legend_pos": "Top-right (inside)"})
             show_plotly_chart(_fig_ov)
             if stage_defs:
                 render_stage_legend_outside(stage_defs)
