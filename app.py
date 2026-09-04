@@ -1783,18 +1783,52 @@ def add_stage_shading(ax, stage_defs, stage_patches):
             stage_patches.append(Patch(facecolor=col, alpha=0.40, label=name))
 
 
+def _plotly_time_extent(fig):
+    """(min, max) over every time-valued x in the figure, or None."""
+    lo = hi = None
+    for tr in fig.data:
+        x = getattr(tr, "x", None)
+        if x is None or len(x) == 0:
+            continue
+        arr = np.asarray(x)
+        if np.issubdtype(arr.dtype, np.number):
+            continue
+        try:
+            xi = pd.to_datetime(pd.Index(arr), errors="coerce").dropna()
+        except Exception:
+            continue
+        if len(xi) == 0:
+            continue
+        a, b = xi.min(), xi.max()
+        lo = a if lo is None else min(lo, a)
+        hi = b if hi is None else max(hi, b)
+    return None if lo is None else (lo, hi)
+
+
 def add_plotly_stage_vrects(
     fig,
     stage_defs,
     fill_opacity: float = 0.08,
     row: Optional[Any] = None,
     col: Optional[int] = None,
+    x_clip: Optional[Tuple[Any, Any]] = None,
 ) -> None:
-    """Shaded vertical bands for experiment stages (all panels or one subplot)."""
+    """Shaded vertical bands for experiment stages (all panels or one subplot).
+
+    Plotly does not clip shapes to the axis, so a stage that starts before the
+    data (an overnight Preparation, say) would be painted into the margin.
+    Bands are therefore clipped to `x_clip`, or to the figure's own time
+    extent when none is given; a stage entirely outside it draws nothing."""
     if not stage_defs:
         return
+    clip = x_clip if x_clip is not None else _plotly_time_extent(fig)
     for (_name, stt, ett, colr) in stage_defs:
-        kw = dict(x0=stt, x1=ett, fillcolor=colr, opacity=fill_opacity, line_width=0)
+        a, b = pd.Timestamp(stt), pd.Timestamp(ett)
+        if clip is not None:
+            a, b = max(a, pd.Timestamp(clip[0])), min(b, pd.Timestamp(clip[1]))
+        if not (b > a):
+            continue
+        kw = dict(x0=a, x1=b, fillcolor=colr, opacity=fill_opacity, line_width=0)
         if row is not None:
             fig.add_vrect(**kw, row=row, col=col if col is not None else 1)
         else:
@@ -1898,11 +1932,40 @@ def render_stage_legend_outside(stage_defs, *, swatch_opacity: float = 0.38) -> 
     )
 
 
+# Stage colours are tied to what a stage *is*, not to where it sits in the
+# log, so Baseline / Release / Decay look the same in a three-stage run and
+# in one that logs a Preparation period first. The first three keep the
+# colours every earlier experiment was drawn with.
+STAGE_KIND_COLOURS: List[Tuple[str, str]] = [
+    ("baseline", "orange"),
+    ("release", "skyblue"),
+    ("decay", "red"),
+    ("prep", "gray"),
+    ("vent", "green"),
+]
+_STAGE_FALLBACK_COLOURS = ["cyan", "brown", "magenta", "olive", "purple"]
+
+
+def stage_colour_for(name, n_unknown_so_far: int) -> Tuple[str, bool]:
+    """Colour for a stage name; (colour, matched_a_kind)."""
+    low = str(name).lower()
+    for kw, col in STAGE_KIND_COLOURS:
+        if kw in low:
+            return col, True
+    return _STAGE_FALLBACK_COLOURS[n_unknown_so_far % len(_STAGE_FALLBACK_COLOURS)], False
+
+
 def prepare_stage_defs(stage_rows):
     if not stage_rows:
         return []
-    colors = ["orange", "skyblue", "red", "cyan", "brown", "green", "magenta"]
-    return [(n, stt, ett, colors[i % len(colors)]) for i, (n, stt, ett) in enumerate(stage_rows)]
+    out = []
+    n_unknown = 0
+    for (n, stt, ett) in stage_rows:
+        col, known = stage_colour_for(n, n_unknown)
+        if not known:
+            n_unknown += 1
+        out.append((n, stt, ett, col))
+    return out
 
 
 def find_release_window(stage_defs):
