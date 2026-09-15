@@ -2842,7 +2842,9 @@ def plot_vertical_profiles_export(
 
 def plot_io_ratio(io_ex, infiltration_factor, t_rel0, t_rel1, t_base0, t_base1, ex_thresh, cfg: AppConfig,
                   *, src_label: str = "CAVE", rcv_label: str = "PK",
-                  window_label: str = "Release window", export_mode: bool = False):
+                  window_label: str = "Release window", export_mode: bool = False,
+                  x_range: Optional[Tuple[Any, Any]] = None,
+                  y_range: Optional[Tuple[float, float]] = None):
     fig, ax = plt.subplots(figsize=(12, 5) if export_mode else (14, 5))
     ax.plot(io_ex.index, io_ex.values, linewidth=2.0,
             label=f"ratio(t) = {rcv_label}_ex / {src_label}_ex (thresholded)")
@@ -2862,9 +2864,16 @@ def plot_io_ratio(io_ex, infiltration_factor, t_rel0, t_rel1, t_base0, t_base1, 
     ax.grid(True, color="0.85", linewidth=0.6)
     ax.set_axisbelow(True)
     ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
-    ax.set_xlim(t_rel0, t_rel1)
+    # Mirror the on-page chart when it says how it was framed (trimmed to the
+    # plotted stretch, or the whole experiment); otherwise frame the window.
+    if x_range is not None:
+        ax.set_xlim(pd.Timestamp(x_range[0]), pd.Timestamp(x_range[1]))
+    else:
+        ax.set_xlim(t_rel0, t_rel1)
 
-    if cfg.use_fixed_ylims:
+    if y_range is not None:
+        ax.set_ylim(*y_range)
+    elif cfg.use_fixed_ylims and not export_mode:
         ax.set_ylim(*cfg.ylims["io_ex"])
 
     plt.xticks(rotation=45)
@@ -7508,6 +7517,8 @@ with tab_ae:
                     "res_win": res_win,
                     "tr": tr,
                     "tr_window": (tr_t0, tr_t1),
+                    "tr_x_range": (t0, t1) if _full_x else _tr_xr,
+                    "tr_y_range": None if _auto_y else cfg.ylims["io_ex"],
                     "df_sc": df_sc,
                     "sc": (sc_slope, sc_intercept, sc_r2),
                     "labels": (src_label, rcv_label),
@@ -7916,6 +7927,7 @@ with tab8:
                         ae["t_base0"], ae["t_base1"], ae_export["ex_thresh"], cfg,
                         src_label=_ae_src, rcv_label=_ae_rcv,
                         window_label="Analysis window", export_mode=True,
+                        x_range=ae_export.get("tr_x_range"), y_range=ae_export.get("tr_y_range"),
                     ),
                     "transfer_ratio", "transfer ratio",
                 )
