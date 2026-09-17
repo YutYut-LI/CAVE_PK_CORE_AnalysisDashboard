@@ -2001,6 +2001,117 @@ def find_release_window(stage_defs):
     return pd.Timestamp(stt), pd.Timestamp(ett), f"only stage available: {name}"
 
 
+def find_release_windows(stage_defs):
+    """Every logged stage whose name says release, in log order, as
+    (start, end, name). An experiment may release more than once."""
+    out = []
+    for (name, stt, ett, _col) in stage_defs or []:
+        if isinstance(name, str) and "release" in name.lower():
+            out.append((pd.Timestamp(stt), pd.Timestamp(ett), name))
+    return out
+
+
+def mfc_release_episodes(mfc_df, flow_on_th: float):
+    """Contiguous stretches of flow above the threshold, as (t_on, t_off).
+
+    A new episode starts after any sample below the threshold, or after a
+    logging gap (a step longer than 5x the median sampling interval), so two
+    releases recorded in two files half an hour apart come out as two."""
+    if mfc_df is None or len(mfc_df) == 0 or "F" not in mfc_df.columns:
+        return []
+    d = mfc_df.sort_values("t").reset_index(drop=True)
+    on = (d["F"] > float(flow_on_th)).to_numpy()
+    dt = d["t"].diff().dt.total_seconds().to_numpy()
+    med = float(np.nanmedian(dt[1:])) if len(dt) > 1 and np.isfinite(np.nanmedian(dt[1:])) else 1.0
+    gap = np.zeros(len(d), dtype=bool)
+    gap[1:] = dt[1:] > max(5.0 * med, 5.0)
+    episodes = []
+    start = None
+    for i in range(len(d)):
+        if on[i] and (start is None or gap[i] or not on[i - 1]):
+            if start is not None:
+                episodes.append((d["t"].iloc[start], d["t"].iloc[i - 1]))
+            start = i
+        elif not on[i] and start is not None:
+            episodes.append((d["t"].iloc[start], d["t"].iloc[i - 1]))
+            start = None
+    if start is not None:
+        episodes.append((d["t"].iloc[start], d["t"].iloc[len(d) - 1]))
+    return [(pd.Timestamp(a), pd.Timestamp(b)) for a, b in episodes]
+
+
+def mfc_lock_range(episodes, release_windows, pad_frac: float = 0.06):
+    """Time range that frames every detected episode and every logged
+    release stage, with a little padding; None when there is nothing."""
+    pts = [t for a, b in (episodes or []) for t in (a, b)] + [t for a, b, *_ in (release_windows or []) for t in (a, b)]
+    pts = [pd.Timestamp(t) for t in pts if t is not None and pd.notna(t)]
+    if not pts:
+        return None
+    lo, hi = min(pts), max(pts)
+    pad = max((hi - lo) * pad_frac, pd.Timedelta(seconds=30))
+    return lo - pad, hi + pad
+
+
+def mfc_release_summary(mfc_df, flow_on_th: float):
+    """MFC summary over every flow-on sample. Returns
+    (summary_or_None, t_on, t_off, episodes). Volume is integrated over
+    the recorded samples only, never across a logging gap."""
+    if mfc_df is None:
+        return None, None, None, []
+    mask_on = mfc_df["F"] > flow_on_th
+    if not mask_on.any():
+        return None, None, None, []
+    episodes = mfc_release_episodes(mfc_df, flow_on_th)
+    t_on = mfc_df.loc[mask_on, "t"].min()
+    t_off = mfc_df.loc[mask_on, "t"].max()
+    df_on = mfc_df.loc[mask_on].copy()
+
+    f_mean = float(df_on["F"].mean())
+    f_std = float(df_on["F"].std(ddof=1)) if len(df_on) > 1 else np.nan
+    f_min = float(df_on["F"].min())
+    f_max = float(df_on["F"].max())
+
+    _is_gap, _med_step = mfc_sampling_gaps(df_on)
+    dt_s = df_on["t"].diff().dt.total_seconds()
+    gap_s = float(dt_s.where(_is_gap).sum(skipna=True))
+    dt_min = dt_s.where(~_is_gap).fillna(0) / 60.0
+    vol_per_sample = df_on["F"] * dt_min
+    total_l = float(vol_per_sample.sum())
+    f_cv = (f_std / f_mean) if (np.isfinite(f_std) and f_mean > 0) else np.nan
+
+    # Per-episode detail: on-time and volume of each stretch. The volume of
+    # the first sample of an episode carries no dt (nothing before it), which
+    # matches how the total is integrated.
+    ep_rows = []
+    on_time_min = 0.0
+    for a, b in episodes:
+        m = (df_on["t"] >= a) & (df_on["t"] <= b)
+        dur = (b - a).total_seconds() / 60.0
+        on_time_min += dur
+        ep_rows.append(f"{a:%H:%M:%S}–{b:%H:%M:%S} ({dur:.1f} min, {float(vol_per_sample[m].sum()):.1f})")
+
+    _n_src = int(mfc_df["source_file"].nunique()) if "source_file" in mfc_df.columns else 1
+    summary = {
+        "mfc_start": t_on,
+        "mfc_end": t_off,
+        "mfc_duration_min": on_time_min,
+        "mfc_span_min": (t_off - t_on).total_seconds() / 60.0,
+        "mfc_n_episodes": len(episodes),
+        "mfc_episodes": "; ".join(ep_rows),
+        "mfc_source_files": _n_src,
+        "logging_gaps": int(_is_gap.sum()),
+        "logging_gap_total_min": gap_s / 60.0,
+        "sampling_interval_s": _med_step,
+        "flow_mean": f_mean,
+        "flow_std": f_std,
+        "flow_cv": f_cv,
+        "flow_min": f_min,
+        "flow_max": f_max,
+        "total_released_volume": total_l,
+    }
+    return summary, t_on, t_off, episodes
+
+
 def find_baseline_window(stage_defs):
     if stage_defs:
         for (name, stt, ett, col) in stage_defs:
@@ -2655,7 +2766,8 @@ def plot_zone_temp(
 
 
 @st.cache_resource(show_spinner=False, max_entries=6)
-def plot_mfc(mfc_df, t_on, t_off, t_rel0, t_rel1, cfg: AppConfig, *, line_width: float = 2.2, legend_fontsize: int = 10, export_mode: bool = False, x_range: Optional[Tuple[Any, Any]] = None, y_range: Optional[Tuple[float, float]] = None):
+def plot_mfc(mfc_df, t_on, t_off, t_rel0, t_rel1, cfg: AppConfig, *, line_width: float = 2.2, legend_fontsize: int = 10, export_mode: bool = False, x_range: Optional[Tuple[Any, Any]] = None, y_range: Optional[Tuple[float, float]] = None,
+             episodes=None, release_windows=None):
     mfc_df = mfc_plot_frame(mfc_df)
     lw = float(line_width)
     leg_fs = 15 if export_mode else max(5, min(24, int(legend_fontsize)))
@@ -2685,11 +2797,15 @@ def plot_mfc(mfc_df, t_on, t_off, t_rel0, t_rel1, cfg: AppConfig, *, line_width:
         ax2.set_ylabel("Temperature (°C)", fontsize=fs_axis, fontweight="bold", color="#d62728")
         ax2.tick_params(axis="y", labelcolor="#d62728")
 
-    if (t_on is not None) and (t_off is not None):
-        ax.axvspan(t_on, t_off, alpha=0.15, color="green", label="Detected release (F>TH)")
-
-    if (t_rel0 is not None) and (t_rel1 is not None):
-        ax.axvspan(t_rel0, t_rel1, alpha=0.10, color="orange", label="Stage2 (Release)")
+    # One band per detected flow-on episode and one per logged release stage;
+    # an experiment may release more than once.
+    _eps = list(episodes) if episodes else ([(t_on, t_off)] if (t_on is not None and t_off is not None) else [])
+    for k, (a, b) in enumerate(_eps):
+        ax.axvspan(a, b, alpha=0.15, color="green",
+                   label=(f"Detected release (F>TH), {len(_eps)} episode" + ("s" if len(_eps) > 1 else "")) if k == 0 else None)
+    _rws = [(a, b) for a, b, *_ in release_windows] if release_windows else ([(t_rel0, t_rel1)] if (t_rel0 is not None and t_rel1 is not None) else [])
+    for k, (a, b) in enumerate(_rws):
+        ax.axvspan(a, b, alpha=0.10, color="orange", label="Release stage (log)" if k == 0 else None)
 
     if not export_mode:
         title = f"{cfg.exp_code} — MFC Release Quicklook"
@@ -2712,8 +2828,12 @@ def plot_mfc(mfc_df, t_on, t_off, t_rel0, t_rel1, cfg: AppConfig, *, line_width:
     # always locking to the release window.
     if export_mode and x_range is not None and x_range[0] is not None and x_range[1] is not None:
         ax.set_xlim(*x_range)
-    elif (t_rel0 is not None) and (t_rel1 is not None):
-        ax.set_xlim(t_rel0, t_rel1)
+    else:
+        _lock = mfc_lock_range(_eps, _rws)
+        if _lock is not None:
+            ax.set_xlim(*_lock)
+        elif (t_rel0 is not None) and (t_rel1 is not None):
+            ax.set_xlim(t_rel0, t_rel1)
     if export_mode and y_range is not None:
         ax.set_ylim(*y_range)
 
@@ -4639,6 +4759,8 @@ def plot_mfc_plotly(
     lock_x_release: bool = True,
     y_range=None,
     line_width: float = 2.2,
+    episodes=None,
+    release_windows=None,
 ):
     mfc_df = mfc_plot_frame(mfc_df)
     _require_plotly()
@@ -4682,16 +4804,21 @@ def plot_mfc_plotly(
         annotation_text=f"FLOW_ON_TH={cfg.flow_on_th}",
     )
 
-    if (t_on is not None) and (t_off is not None):
-        fig.add_vrect(x0=t_on, x1=t_off, fillcolor="green", opacity=0.15, line_width=0)
-
-    if (t_rel0 is not None) and (t_rel1 is not None):
-        fig.add_vrect(x0=t_rel0, x1=t_rel1, fillcolor="orange", opacity=0.10, line_width=0)
+    _eps = list(episodes) if episodes else ([(t_on, t_off)] if (t_on is not None and t_off is not None) else [])
+    for a, b in _eps:
+        fig.add_vrect(x0=a, x1=b, fillcolor="green", opacity=0.15, line_width=0)
+    _rws = [(a, b) for a, b, *_ in release_windows] if release_windows else ([(t_rel0, t_rel1)] if (t_rel0 is not None and t_rel1 is not None) else [])
+    for a, b in _rws:
+        fig.add_vrect(x0=a, x1=b, fillcolor="orange", opacity=0.10, line_width=0)
 
     if x_start is not None and x_end is not None:
         fig.update_xaxes(range=[x_start, x_end])
-    elif lock_x_release and (t_rel0 is not None) and (t_rel1 is not None):
-        fig.update_xaxes(range=[t_rel0, t_rel1])
+    elif lock_x_release:
+        _lock = mfc_lock_range(_eps, _rws)
+        if _lock is not None:
+            fig.update_xaxes(range=[_lock[0], _lock[1]])
+        elif (t_rel0 is not None) and (t_rel1 is not None):
+            fig.update_xaxes(range=[t_rel0, t_rel1])
 
     layout_kw: Dict[str, Any] = dict(
         title=f"{cfg.exp_code} — MFC Release Quicklook" + (" (flow + temperature)" if has_temp else ""),
@@ -5214,52 +5341,8 @@ try:
         # -----------------------------
         # MFC summary
         # -----------------------------
-        mfc_summary = None
-        t_on = t_off = None
-
-        if mfc_df is not None:
-            mask_on = mfc_df["F"] > cfg.flow_on_th
-            t_on = mfc_df.loc[mask_on, "t"].min() if mask_on.any() else None
-            t_off = mfc_df.loc[mask_on, "t"].max() if mask_on.any() else None
-
-            if mask_on.any():
-                df_on = mfc_df.loc[mask_on].copy()
-                dur_s = (t_off - t_on).total_seconds()
-                dur_min = dur_s / 60.0
-
-                f_mean = float(df_on["F"].mean())
-                f_std = float(df_on["F"].std(ddof=1)) if len(df_on) > 1 else np.nan
-                f_min = float(df_on["F"].min())
-                f_max = float(df_on["F"].max())
-
-                # Integrate flow over time, but never across a logging gap:
-                # the step there spans a stretch with no record, and pretending
-                # the last known flow held for all of it would invent gas that
-                # may never have been released. Those steps contribute nothing
-                # and are reported separately instead.
-                _is_gap, _med_step = mfc_sampling_gaps(df_on)
-                dt_s = df_on["t"].diff().dt.total_seconds()
-                gap_s = float(dt_s.where(_is_gap).sum(skipna=True))
-                dt_min = dt_s.where(~_is_gap).fillna(0) / 60.0
-                total_l = float((df_on["F"] * dt_min).sum())
-                f_cv = (f_std / f_mean) if (np.isfinite(f_std) and f_mean > 0) else np.nan
-
-                _n_src = int(mfc_df["source_file"].nunique()) if "source_file" in mfc_df.columns else 1
-                mfc_summary = {
-                    "mfc_start": t_on,
-                    "mfc_end": t_off,
-                    "mfc_duration_min": dur_min,
-                    "mfc_source_files": _n_src,
-                    "logging_gaps": int(_is_gap.sum()),
-                    "logging_gap_total_min": gap_s / 60.0,
-                    "sampling_interval_s": _med_step,
-                    "flow_mean": f_mean,
-                    "flow_std": f_std,
-                    "flow_cv": f_cv,
-                    "flow_min": f_min,
-                    "flow_max": f_max,
-                    "total_released_volume": total_l,
-                }
+        mfc_summary, t_on, t_off, mfc_episodes = mfc_release_summary(mfc_df, cfg.flow_on_th)
+        t_rel_windows = find_release_windows(stage_defs)
 
         # -----------------------------
         # Figures (overall + zones + optional MFC)
@@ -5297,7 +5380,8 @@ try:
         lw_mfc, _ = _line_marker_from_prefix("mfc")
         leg_mfc = _legend_fs_from_prefix("mfc")
         fig_mfc = (
-            plot_mfc(mfc_df, t_on, t_off, t_rel0, t_rel1, cfg, line_width=lw_mfc, legend_fontsize=leg_mfc)
+            plot_mfc(mfc_df, t_on, t_off, t_rel0, t_rel1, cfg, line_width=lw_mfc, legend_fontsize=leg_mfc,
+                     episodes=mfc_episodes, release_windows=t_rel_windows)
             if mfc_df is not None
             else None
         )
@@ -7620,7 +7704,8 @@ with tab7:
                 render_save_reset_row("mfc", mfc_def)
                 render_font_legend_widgets("mfc")
                 render_series_line_marker_widgets("mfc")
-                st.checkbox("Lock x-axis to release window", key="mfc__lock_x_release")
+                st.checkbox("Lock x-axis to release window", key="mfc__lock_x_release",
+                            help="Frames every detected flow-on episode and every logged Release stage.")
                 st.checkbox("Custom y-axis limits", key="mfc__use_custom_y")
                 ym1, ym2 = st.columns(2)
                 with ym1:
@@ -7633,7 +7718,7 @@ with tab7:
 
             lock_rx = bool(st.session_state.get("mfc__lock_x_release", True))
             if lock_rx:
-                xs, xe = t_rel0, t_rel1
+                xs, xe = mfc_lock_range(mfc_episodes, t_rel_windows) or (t_rel0, t_rel1)
             else:
                 xs, xe = render_x_controls("mfc", t0, t1, stage_defs)
             y_r = None
@@ -7651,6 +7736,8 @@ with tab7:
                 x_start=xs,
                 x_end=xe,
                 lock_x_release=False,
+                episodes=mfc_episodes,
+                release_windows=t_rel_windows,
                 y_range=y_r,
                 line_width=lw_mfc,
             )
@@ -7799,7 +7886,7 @@ with tab8:
 
         lock_rx_exp = bool(st.session_state.get("mfc__lock_x_release", True))
         if lock_rx_exp:
-            xs_exp, xe_exp = t_rel0, t_rel1
+            xs_exp, xe_exp = mfc_lock_range(mfc_episodes, t_rel_windows) or (t_rel0, t_rel1)
         else:
             xs_exp, xe_exp = render_x_controls("mfc", t0, t1, stage_defs)
         y_r_exp = None
@@ -7844,6 +7931,7 @@ with tab8:
                     mfc_df, t_on, t_off, t_rel0, t_rel1, cfg,
                     line_width=lw_mfc, legend_fontsize=leg_mfc, export_mode=True,
                     x_range=(xs_exp, xe_exp), y_range=y_r_exp,
+                    episodes=mfc_episodes, release_windows=t_rel_windows,
                 )
                 _download_row(fig_mfc_export, "mfc_quicklook", "MFC quicklook")
 
