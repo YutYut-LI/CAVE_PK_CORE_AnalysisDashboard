@@ -507,6 +507,26 @@ def load_stages_from_log(file_bytes: bytes, filename: str, sheet="Summary Experi
     return rows
 
 
+def stages_overlap_data(stage_rows, t_lo, t_hi) -> bool:
+    """True if at least one logged stage touches the data's time range."""
+    lo, hi = pd.Timestamp(t_lo), pd.Timestamp(t_hi)
+    return any(pd.Timestamp(b) > lo and pd.Timestamp(a) < hi for (_n, a, b) in stage_rows)
+
+
+def shift_stage_rows_to_data(stage_rows, t_lo):
+    """Move every stage by the same whole number of days so the first stage
+    starts on the data's first day. For a log whose times of day are right
+    but whose date (typically the year) was typed wrong. Returns
+    (shifted_rows, shift_days)."""
+    if not stage_rows:
+        return stage_rows, 0
+    first = min(pd.Timestamp(a) for (_n, a, _b) in stage_rows)
+    shift = pd.Timestamp(t_lo).normalize() - first.normalize()
+    days = int(round(shift.total_seconds() / 86400.0))
+    delta = pd.Timedelta(days=days)
+    return [(n, pd.Timestamp(a) + delta, pd.Timestamp(b) + delta) for (n, a, b) in stage_rows], days
+
+
 def _clean_mfc_column_name(name: str) -> str:
     return str(name).strip().lstrip("\ufeff").strip()
 
@@ -4980,6 +5000,26 @@ try:
             except Exception as e:
                 st.warning(f"Could not read stage log: {e}")
                 stage_rows = []
+
+        # A stage log whose dates miss the data entirely (a wrong year is the
+        # usual cause) would silently draw no stage anywhere. Say so, and let
+        # the user slide the log onto the data's date when only the date is off.
+        if stage_rows and not stages_overlap_data(stage_rows, df["time"].min(), df["time"].max()):
+            _shifted_rows, _shift_days = shift_stage_rows_to_data(stage_rows, df["time"].min())
+            _log_day = min(pd.Timestamp(a) for (_n, a, _b) in stage_rows)
+            st.warning(
+                f"The stage log's dates start on **{_log_day:%Y-%m-%d}**, but the data run from "
+                f"**{pd.Timestamp(df['time'].min()):%Y-%m-%d %H:%M}** to "
+                f"**{pd.Timestamp(df['time'].max()):%Y-%m-%d %H:%M}** — no stage overlaps the data, so none "
+                "would appear on any chart. Check the dates (usually the year) in the log's "
+                "'Summary Experiment Stages' sheet, or tick the box below if only the date is wrong."
+            )
+            if st.checkbox(
+                f"Shift all stage dates by {_shift_days:+d} days so they land on the data's date "
+                "(times of day unchanged)",
+                key="__stage_shift_to_data", value=False,
+            ):
+                stage_rows = _shifted_rows
 
         stage_defs = prepare_stage_defs(stage_rows)
 
